@@ -3,6 +3,8 @@ Code used in analyses for https://www.biorxiv.org/content/10.1101/2023.03.17.533
  
 This repo contains analysis scripts and Pytorch training scripts, which are meant to be modified on an ad hoc basis, depending on user needs.
 I recommend modifying code as you see fit (e.g. to change file paths, comment out parts of analyses you want to omit, etc.).
+
+Scripts tested on both CentOS Linux 7 (Core) and macOS Monterrey.
  
 INSTALLATION
  
@@ -29,13 +31,18 @@ matplotlib
  
 For one analysis, I used CounTR (https://github.com/Verg-Avesta/CounTR). I copied their repo locally and created an environment variable to specify its filepath (see tcc_plotting.py).
  
-Not all of these packages may be necessary for all analyses, so if you are experiencing compatibility issues, I recommend commenting out code you don't need.
+Not all of these packages may be necessary for all analyses, so if you are experiencing compatibility issues, I recommend commenting out code you don't need. Installation time for Python packages on typical laptop hardware should a few minutes.
+
  
 USAGE: 
  
 To fit TCC models for different DNN architectures on human responses in Scene Wheels dataset and save results to file: 
  
 python TCC_modeling.py --model-classes vgg19 clip_RN50 clip_ViT-B16 --scene-wheels-summary  
+
+Code can be tested on the 'rgb' baseline model, which is less resource-intensive:
+
+python TCC_modeling.py --model-classes rgb --scene-wheels-summary  
  
 To produce the DNN comparison scatter plot:  
  
