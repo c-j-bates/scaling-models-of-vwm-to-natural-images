@@ -1,0 +1,2902 @@
+from itertools import product
+import json
+from mahotas.features import surf
+import matplotlib.pyplot as plt
+from networks import MLP
+import numpy as np
+import os
+import pandas as pd
+from pathlib import Path
+from PIL import Image
+from scipy.stats import spearmanr, circvar
+import sys
+from TCC_modeling import (
+    standardize_angles,
+    _get_binned_averages,
+    TCCSceneWheel,
+    TCCBrady,
+    TCCBays,
+    make_and_load,
+    make_vae_args,
+    load_wheel_imgs,
+    torchvision_embed,
+    clip_embed,
+    cossim,
+    cossim_torch,
+    sample_TCC,
+    _get_binned_averages,
+    rgb_from_angle,
+)
+import torch
+from torchvision import transforms
+from train import train_mlp
+from tqdm import tqdm
+import visualpriors
+
+# Add CounTR local repository to path
+sys.path.append(os.environ['COUNTR_PATH'])
+# Pytorch device (global var)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+MODELS_DICT = {}
+spth = os.environ.get('DATA_STORAGE')
+if spth is not None:
+    DATA_STORAGE = Path(spth).joinpath('psychophysical_scaling')
+else:
+    DATA_STORAGE = './'
+MODEL_OUT_PATH = Path(DATA_STORAGE).joinpath('load_analysis')
+
+
+def make_scene_wheel_df(wheels_pth, ext='webp'):
+    radius_vals = [2, 4, 8, 16, 32]
+    webp_imgs = {}
+    size_uncomp = {}  # Uncompressed size
+    size_on_disk = {}  # Compressed size
+    df = pd.DataFrame({
+        'wheel_id': [],
+        'radius': [],
+        'value': [],
+        'disk_size': [],
+        'uncomp_size': [],
+    })
+    for i in range(1, 6):
+        pth = wheels_pth.joinpath(f"Wheel0{i}")
+        webp_imgs[i + 1] = {}
+        size_uncomp[i + 1] = {}
+        size_on_disk[i + 1] = {}
+        for r in radius_vals:
+            pth1 = pth.joinpath(f'wheel0{i}_r{str(r).zfill(2)}')
+            for j in range(360):
+                pth2 = pth1.joinpath(f'{str(j).zfill(6)}.webp')
+                img = Image.open(pth2)
+                if ext == 'webp':
+                    disk_size = os.stat(pth2).st_size
+                else:
+                    # img.convert(ext).save(f'_tmp.{ext}')  # Doesn't work due to bug...
+                    # Hack it like this:
+                    Image.fromarray(np.array(img)).save(f'_tmp.{ext}')
+                    disk_size = os.stat(f'_tmp.{ext}').st_size
+                uncomp_size = np.array(img).nbytes
+                df = pd.concat([
+                    df,
+                    pd.DataFrame({
+                        'file_path': [pth2],
+                        'wheel_id': [i],
+                        'radius': [r],
+                        'value': [j],
+                        'disk_size': [disk_size],
+                        'uncomp_size': [uncomp_size],
+                    })
+                ])
+    return df
+
+
+def load_countr():
+    from CounTR import models_mae_cross
+    # Prepare model
+    model = models_mae_cross.__dict__['mae_vit_base_patch16'](norm_pix_loss='store_true')
+    model.to(device)
+    model_without_ddp = model
+    weights_pth = './CounTR/weights/FSC147.pth'
+    checkpoint = torch.load(weights_pth, map_location='cpu')
+    model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+    print("Resume checkpoint %s" % weights_pth)
+    model.eval()
+    return model
+
+
+def estimate_setsize_scene_wheels(model, pth):
+    """
+    Use pre-trained object counting network to get estimated number of objects
+    (essentially, set-size) for a scene wheel stimulus (loaded from `pth`).
+
+    Using zero-shot inference mode of CounTR:
+    https://github.com/Verg-Avesta/CounTR
+    """
+
+    def load_image(pth):
+        image = Image.open(pth)
+        image.load() 
+        W, H = image.size
+        # Resize the image size so that the height is 384
+        new_H = 384
+        new_W = 16*int((W/H*384)/16)
+        scale_factor_H = float(new_H)/ H
+        scale_factor_W = float(new_W)/ W
+        image = transforms.Resize((new_H, new_W))(image)
+        image = transforms.ToTensor()(image)
+        return image
+
+    def run_one_image(samples, model, boxes=[], pos=[]):
+        _,_,h,w = samples.shape
+        if boxes == []:
+            boxes = torch.Tensor(boxes).unsqueeze(0).to(device, non_blocking=True)
+        
+        s_cnt = 0
+        for rect in pos:
+            if rect[2]-rect[0]<10 and rect[3] - rect[1]<10:
+                s_cnt +=1
+
+        density_map = torch.zeros([h,w])
+        density_map = density_map.to(device, non_blocking=True)
+        start = 0
+        prev = -1
+        with torch.no_grad():
+            while start + 383 < w:
+                # output, = model(samples[:,:,:,start:start+384], boxes, 3)
+                output, = model(samples[:,:,:,start:start+384], boxes, 0)  # Zero-shot
+                output=output.squeeze(0)
+                b1 = torch.nn.ZeroPad2d(padding=(start, w-prev-1, 0, 0))
+                d1 = b1(output[:,0:prev-start+1])
+                b2 = torch.nn.ZeroPad2d(padding=(prev+1, w-start-384, 0, 0))
+                d2 = b2(output[:,prev-start+1:384])            
+                b3 = torch.nn.ZeroPad2d(padding=(0, w-start, 0, 0))
+                density_map_l = b3(density_map[:,0:start])
+                density_map_m = b1(density_map[:,start:prev+1])
+                b4 = torch.nn.ZeroPad2d(padding=(prev+1, 0, 0, 0))
+                density_map_r = b4(density_map[:,prev+1:w])
+                density_map = density_map_l + density_map_r + density_map_m/2 + d1/2 +d2
+                prev = start + 383
+                start = start + 128
+                if start+383 >= w:
+                    if start == w - 384 + 128: break
+                    else: start = w - 384
+            pred_cnt = torch.sum(density_map/60).item()
+            e_cnt = 0
+            for rect in pos:
+                e_cnt += torch.sum(density_map[rect[0]:rect[2]+1,rect[1]:rect[3]+1]/60).item()
+            e_cnt = e_cnt / 3
+            if e_cnt > 1.8:
+                pred_cnt /= e_cnt
+            return pred_cnt
+
+    # Test on the new image
+    samples = load_image(pth)
+    samples = samples.unsqueeze(0).to(device, non_blocking=True)
+    count = run_one_image(samples, model)
+    return count
+
+
+def segmentation_pca(preds):
+    """
+    For converting from Taskonomy's 2D and 2.5D segmentation to a 3-channel
+    image.
+
+    Taken from:
+    https://github.com/StanfordVL/taskonomy/blob/master/taskbank/tools/task_viz.py
+
+    See also:
+    https://github.com/StanfordVL/taskonomy/blob/d486b5ecb7718531669a35d4fe3022a19c2bb377/code/tools/run_img_task.py
+    """
+    from sklearn.decomposition import PCA
+
+    preds = np.squeeze(preds)
+    preds_flat = preds.reshape((64, -1)).T
+    pca = PCA(n_components=3)
+    preds1 = pca.fit_transform(preds_flat).reshape((256, 256, -1))
+    preds1 = (preds1 - preds1.min()) / (preds1.max() - preds1.min())
+    preds1 = np.moveaxis(preds1, -1, 0)
+    preds1 = torch.Tensor(preds1)
+    # transforms.ToPILImage()(preds1).show()
+    return preds1
+
+
+def get_midvision_features(feature_type, pth, save=True):
+    """
+    Mid-level features come from:
+    https://github.com/alexsax/midlevel-reps
+    """
+    feat_pth = Path(
+        # f'midlevel_vision_features/{feature_type}/{pth}.npy'
+        f'{MODEL_OUT_PATH}/midlevel_vision_features/{feature_type}/{pth}.npy'
+    )
+    if feat_pth.exists():
+        Z = torch.Tensor(np.load(feat_pth))
+    else:
+        img = Image.open(pth)
+        img = transforms.Compose([
+            transforms.ToTensor(), transforms.Resize((256, 256))
+        ])(img).unsqueeze(0) * 2 - 1
+        Z = visualpriors.feature_readout(
+            img.to(device), feature_type, device=device
+        ).squeeze(0)
+        feat_pth.parent.mkdir(parents=True, exist_ok=True)
+        if save:
+            np.save(feat_pth, Z.detach().cpu().numpy())
+    return Z
+
+
+def save_midvision_to_image(Z, out_pth, feature_type):
+    if feature_type in ['segment_unsup2d', 'segment_unsup25d']:
+        # Do PCA to get down to 3 channels
+        Z = segmentation_pca(Z.detach().cpu().numpy())
+    else:
+        Z = (Z + 1.) / 2.
+    Path(out_pth).parent.mkdir(parents=True, exist_ok=True)
+    transforms.ToPILImage()(Z).save(out_pth)
+
+
+def get_midvision_complexity(feature_type, pth, ext='jpg'):
+    """
+    Get 'complexity' of predictions from mid-level vision features by saving
+    outputs as PIL image and reading out file size.
+
+    """
+    Z = get_midvision_features(feature_type, pth)
+    if 'keypoints' in feature_type:
+        # Summed activation as complexity
+        complexity = float(Z.abs().sum().detach().cpu().numpy())
+    else:
+        out_pth = f'_tmp.{ext}'
+        save_midvision_to_image(Z, out_pth, feature_type)
+        complexity = os.stat(out_pth).st_size  # File size as complexity
+    return complexity
+
+
+def get_surf_complexity(pth):
+    img = np.array(Image.open(pth).convert('L'))
+    spoints = surf.surf(img)
+
+    # Complexity as simple count of keypoints returned by SURF
+    # complexity = len(spoints)
+
+    # Complexity as sum of Hessian scores returned by SURF for each key point
+    complexity = spoints[:, 3].sum()
+
+    # Complexity as sum of scale sizes for each keypoint. Idea is to weight
+    # larger scales more than smaller scales, if attention 'cares' more about
+    # macroscopic objects
+    # complexity = 1 / spoints[:, 2].sum()
+
+    # Complexity as entropy of spatial distribution of keypoints, discretized
+    # to grid
+    # yi = spoints[:, 0].astype(int)
+    # xi = spoints[:, 1].astype(int)
+    # bins = np.arange(0, img.shape[0], 8)
+    # xid = np.digitize(xi, bins)
+    # yid = np.digitize(yi, bins)
+    # ids = [str(x) for x in zip(xid, yid)]
+    # counts = {(i, j): 1 for i, j in product(range(1, len(bins) + 1), repeat=2)}
+    # for i, j in zip(xid, yid):
+    #     counts[(i, j)] += 1
+    # total = len(spoints)
+    # probs = np.array(list(counts.values())) / total
+    # entropy = (-np.log(probs) * probs).sum()
+    # complexity = entropy
+
+    return complexity
+
+
+def get_torchvision_complexity(pth, model='vgg19', layer=33, ctype='mean_abs'):
+    feat_pth = Path(
+        f'{MODEL_OUT_PATH}/torchvision_features/{model}_{layer}/{pth}.npy'
+        # f'data_tcc/load/torchvision_features/{model}_{layer}/{pth}.npy'
+    )
+    if feat_pth.exists():
+        Z = np.load(feat_pth)
+    else:
+        img = Image.open(pth)
+        X = [transforms.ToTensor()(img)]
+        Z = torchvision_embed(X, layer, model, flatten=False)
+        feat_pth.parent.mkdir(parents=True, exist_ok=True)
+        np.save(feat_pth, np.array(Z))
+    if ctype == 'mean_abs':
+        complexity = np.abs(Z).mean()
+    elif ctype == 'spatial_entropy':
+        # Look at spatial distribution of activations. E.g., if high
+        # activations are more evenly distributed across image, this might
+        # mean greater attentional load in viewers.
+        total = np.abs(Z).sum()
+        n, m = Z.shape[-2:]
+        probs = np.abs(Z).sum(axis=-3) / total
+        probs[probs == 0] = 1e-8
+        entropy = (-np.log(probs) * probs).sum()
+        complexity = entropy
+    else:
+        raise NotImplementedError()
+    # if layer == 36:
+    #     print(f'Prop. units = 0: {(Z == 0).sum() / Z.size}')
+    #     fig, ax = plt.subplots()
+    #     ax.hist(Z.reshape(-1), bins=50)
+    #     plt.show()
+    #     from ipdb import set_trace; set_trace()
+    return complexity
+
+
+def load_vae(tcc, beta):
+    idx_vae = tcc.models[tcc.models.name == f'vae_beta{beta}'].index.values[0]
+    epoch = eval(tcc.models.specs.values[idx_vae])[-1]
+    vae_model = make_and_load(make_vae_args(
+        beta=beta,
+        start_epoch=epoch,
+        pixel_only=True,
+    ))[0].eval()
+    return vae_model
+
+
+def get_vae_complexity(pth, tcc, beta=0.01):
+    feat_pth = Path(f'{MODEL_OUT_PATH}/vae_features/beta{beta}/{pth}.npy')
+    if feat_pth.exists():
+        Z = torch.Tensor(np.load(feat_pth))
+    else:
+        name = f'vae_beta{beta}'
+        if name in MODELS_DICT.keys():
+            vae_model = MODELS_DICT[name]
+        else:
+            vae_model = load_vae(tcc, beta)
+            MODELS_DICT[name] = vae_model
+
+        # Get features
+        img = Image.open(pth)
+        preproc = transforms.Compose([
+            transforms.Resize((tcc.imgsize_vae, tcc.imgsize_vae)),
+            transforms.ToTensor(),
+        ])
+        X = preproc(img).unsqueeze(0)
+        att_map = torch.zeros(
+            (len(X), tcc.imgsize_vae, tcc.imgsize_vae)
+        ).float()
+        with torch.no_grad():
+            Z, _, log_var, _ = vae_model(X.to(device), att_map.to(device))
+        Z = Z.detach().cpu().numpy()
+        feat_pth.parent.mkdir(parents=True, exist_ok=True)
+        np.save(feat_pth, Z)
+    complexity = np.abs(Z).mean()
+    return complexity
+
+
+def get_visual_complexity_data(bin_size, ext='jpg'):
+    df_pth = Path(MODEL_OUT_PATH).joinpath('load_measures.csv')
+    if df_pth.exists():
+        df_binned = pd.read_csv(df_pth)
+        print(f'Loaded dataframe from {df_pth}')
+    else:
+        wheels_pth = Path('scene_wheels_mack_lab_osf').joinpath(
+            'scene_wheel_images', 'sceneWheel_images_webp'
+        )
+        df = make_scene_wheel_df(wheels_pth, ext=ext)
+        tcc = TCCSceneWheel()
+
+        # Load CounTR (for estimating object counts in natural images)
+        countr_model = load_countr()
+
+        dfh = tcc.human_data
+        df_binned = pd.DataFrame({
+            'wheel_id': [],
+            'radius': [],
+            'bin_left': [],
+            'mean_error': [],
+            'mean_disk_size': [],
+        })
+        for name, group in tqdm(df.groupby(['wheel_id', 'radius'])):
+            for bin_ in np.arange(0, 360, bin_size):
+                rng = range(bin_, bin_ + bin_size)
+                mean_disk_size = group[group.value.isin(rng)].disk_size.mean()
+                mean_uncomp_size = group[group.value.isin(rng)].uncomp_size.mean()
+                dfh_g = dfh[(dfh.wheel_num == name[0]) & (dfh.radius == name[1])]
+                mean_error = dfh_g[dfh_g.answer.isin(rng)].error.abs().mean()
+
+                # VAE
+                vae = [
+                    get_vae_complexity(pth, tcc, beta=0.01)
+                    for pth in group[group.value.isin(rng)].file_path.values
+                ]
+
+                # VGG19
+                vgg19_layers = [4, 8, 17, 26, 33, 35]
+                vgg19_mean_abs = {
+                    layer: [
+                        get_torchvision_complexity(
+                            pth, model='vgg19', layer=layer, ctype='mean_abs'
+                        )
+                        for pth in group[group.value.isin(rng)].file_path.values
+                    ]
+                    for layer in vgg19_layers
+                }
+                vgg19_spat_ent = {
+                    layer: [
+                        get_torchvision_complexity(
+                            pth, model='vgg19', layer=layer, ctype='spatial_entropy'
+                        )
+                        for pth in group[group.value.isin(rng)].file_path.values
+                    ]
+                    for layer in vgg19_layers
+                }
+
+                # CounTR
+                count_estimates = [
+                    estimate_setsize_scene_wheels(countr_model, pth)
+                    for pth in group[group.value.isin(rng)].file_path.values
+                ]
+
+                # Taskonomy
+                kp2d = [
+                    get_midvision_complexity('keypoints2d', pth, ext=ext)
+                    for pth in group[group.value.isin(rng)].file_path.values
+                ]
+                kp3d = [
+                    get_midvision_complexity('keypoints3d', pth, ext=ext)
+                    for pth in group[group.value.isin(rng)].file_path.values
+                ]
+                seg2d = [
+                    get_midvision_complexity('segment_unsup2d', pth, ext=ext)
+                    for pth in group[group.value.isin(rng)].file_path.values
+                ]
+                seg25d = [
+                    get_midvision_complexity('segment_unsup25d', pth, ext=ext)
+                    for pth in group[group.value.isin(rng)].file_path.values
+                ]
+                # TODO
+                # segsem = [
+                #     get_midvision_complexity('segment_semantic', pth, ext=ext)
+                #     for pth in group[group.value.isin(rng)].file_path.values
+                # ]
+
+                # surf_count = [
+                #     get_surf_complexity(pth)
+                #     for pth in group[group.value.isin(rng)].file_path.values
+                # ]
+
+                df_binned = pd.concat([
+                    df_binned,
+                    pd.DataFrame({
+                        'wheel_id': [name[0]],
+                        'radius': [name[1]],
+                        'bin_left': [bin_],
+                        'mean_error': [mean_error],
+                        'mean_disk_size': [mean_disk_size],
+                        'vae_beta0.01': np.mean(vae),
+                        'countr_estimate': np.mean(count_estimates),
+                        'keypoints_2d': np.mean(kp2d),
+                        'keypoints_3d': np.mean(kp3d),
+                        # 'surf_count': np.mean(surf_count),
+                        'seg_2d_mean': np.mean(seg2d),
+                        'seg_25d_mean': np.mean(seg25d),
+                        'vgg19_l4_mean_abs': np.mean(vgg19_mean_abs[4]),
+                        'vgg19_l8_mean_abs': np.mean(vgg19_mean_abs[8]),
+                        'vgg19_l17_mean_abs': np.mean(vgg19_mean_abs[17]),
+                        'vgg19_l26_mean_abs': np.mean(vgg19_mean_abs[26]),
+                        'vgg19_l33_mean_abs': np.mean(vgg19_mean_abs[33]),
+                        'vgg19_l35_mean_abs': np.mean(vgg19_mean_abs[35]),
+                        'vgg19_l4_spatial_entropy': np.mean(vgg19_spat_ent[4]),
+                        'vgg19_l8_spatial_entropy': np.mean(vgg19_spat_ent[8]),
+                        'vgg19_l17_spatial_entropy': np.mean(vgg19_spat_ent[17]),
+                        'vgg19_l26_spatial_entropy': np.mean(vgg19_spat_ent[26]),
+                        'vgg19_l33_spatial_entropy': np.mean(vgg19_spat_ent[33]),
+                        'vgg19_l35_spatial_entropy': np.mean(vgg19_spat_ent[35]),
+                    })
+                ])
+        df_binned.to_csv(df_pth)
+        print(f'Saved dataframe to {df_pth}')
+    return df_binned
+
+
+def stimulus_difficulty_analysis(
+    bin_size=30, ext='jpg', reg_type='linear', shuffle_baseline=False
+):
+    def get_plot_data(df, measures_set, percentiles, dnn_models=[]):
+        pdata = {}
+        for measure in measures_set:
+            bins = np.nanpercentile(df[measure], percentiles)
+            bins[-1] += 1e-6  # Hack to make sure last bin handled correctly
+            bin_ids = np.digitize(df[measure], bins)
+            pdata[measure] = [
+                # Bin mean of complexity measure
+                [(bins[i] + bins[i + 1]) / 2 for i in range(len(bins) - 1)],
+                # Human mean error
+                [
+                    df[(bin_ids == idx) & (~np.isnan(df[measure]))].mean_error.mean()
+                    for idx in range(1, len(percentiles))
+                ],
+            ] + [
+                # Model errors
+                [
+                    df[(bin_ids == idx) & (~np.isnan(df[measure]))][f'{dnn}_mean_error'].mean()
+                    for idx in range(1, len(percentiles))
+                ]
+                for dnn in dnn_models
+            ]
+        return pdata
+
+    def _train(X, y, epochs=10000, hidden_dim=4000, lr=0.001, weight_decay=0):
+        act = None if reg_type == 'linear' else 'relu'
+        model = MLP(X.shape[1], out_dim=2, hidden_dim=hidden_dim, activation=act)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=lr, weight_decay=weight_decay,
+        )
+        dataset = torch.utils.data.TensorDataset(
+            torch.Tensor(X), torch.Tensor(y)
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=128,
+            shuffle=True,
+            # num_workers=4,
+        )
+        model = train_mlp(
+            model, optimizer, loader, start_epoch=-1, end_epoch=epochs
+        )
+        return model
+
+    def _whiten(X):
+        X -= X.mean(axis=1, keepdims=True)
+        X = X / X.std(axis=1, keepdims=True)
+        return X
+
+    def _make_train_test_split(df):
+        X = np.array([df[m].values for m in measures_set]).T
+        X = _whiten(X)
+        y = df.mean_error.values
+        y2 = np.vstack([
+            # Break angle into (x, y) components
+            np.cos(y * np.pi / 180), np.sin(y * np.pi / 180)
+        ]).T * 2  # 2x dilation factor
+        idx_train = np.random.choice(
+            len(X), size=len(X) // 2, replace=False
+        )
+        X_train = X[idx_train]
+        y_train = y2[idx_train]
+        idx_test = [i for i in range(len(X)) if i not in idx_train]
+        X_test = X[idx_test]
+        return (X, X_train, X_test), (y, y_train), (idx_train, idx_test)
+
+    def experiment_iter(df, measures_set, shuffle_baseline=False):
+        (X, X_train, X_test), (y, y_train), (idx_train, idx_test) = _make_train_test_split(df)
+        if shuffle_baseline:
+            np.random.shuffle(y_train)
+
+        # Neural network regression
+        model = _train(X_train, y_train)
+        y_pred = model(torch.Tensor(X_test).to(device)).detach().cpu().numpy()
+        y_pred_angle = np.arctan2(y_pred[:, 1], y_pred[:, 0]) / 2  # Divide by 2 to un-dilate
+        rho = spearmanr(y_pred_angle, y[idx_test])[0]
+        print(f'rho: {rho}')
+        return rho
+
+    def _do_sklearn_regression(df, df_train, min_feat=1, iter_=0):        
+        from sklearn.linear_model import LinearRegression
+        from sklearn.feature_selection import RFECV
+        model = LinearRegression()
+        rfe = RFECV(model, min_features_to_select=min_feat)
+        idxs = df_train.groupby("radius").sample(frac=0.5, replace=False).index
+        X_train = df_train.loc[idxs, measures_set]
+        y_train = df_train.loc[idxs].mean_error
+        # Convert to log-odds in order for target to be in (-inf, inf)
+        y_train = np.log(y_train / (180 - y_train))  # 180 deg is max error
+        rfe.fit(X_train, y_train)
+        X = df.loc[~df.index.isin(idxs), measures_set]
+        pred = rfe.predict(X)
+        df.loc[~df.index.isin(idxs), f'reg_preds_iter{iter_}'] = np.exp(pred) / (1 + np.exp(pred))
+        return idxs, rfe.ranking_
+
+    def _plot_nn(iter_, measures_set, df, df_train, shuffle_baseline=False, num_plot_iters=50):
+        for it in range(num_plot_iters):
+            # Train model de novo on subset of radii
+            (_, X_train, X_test), (_, y_train), (idx_train, idx_test) = _make_train_test_split(df_train)
+            if shuffle_baseline:
+                np.random.shuffle(y_train)
+            model = _train(X_train, y_train, 10000)
+            # Evaluate on all radii
+            X = np.array([df[m].values for m in measures_set]).T
+            X = _whiten(X)
+            y = model(torch.Tensor(X).to(device)).detach().cpu().numpy()
+            ya = np.arctan2(y[:, 1], y[:, 0]) / 2  # Divide by 2 to un-dilate
+            # Add new feature to df which is prediction from regression model
+            df[f'reg_preds_iter{it}'] = ya
+
+        out_pth = Path('figures').joinpath(
+            'summary',
+            'scene_wheels',
+            f'load_{reg_type}_RFE_iter{iter_}.pdf'
+        )
+        _plot_reg_results(
+            out_pth,
+            df,
+            radii=df_train.radius.unique(),
+            num_iters=num_plot_iters
+        )
+
+    def _plot_reg_results(
+        out_pth,
+        df,
+        err_interv=None,
+        err_means=None,
+        radii=[2, 4, 8],
+        num_iters=1,
+        use_saved=True,
+        dnn_models=['clip_RN50', 'vgg19'],
+    ):
+        # Plotting binned by percentile
+        out_pth.parent.mkdir(parents=True, exist_ok=True)
+        # fig, axes = plt.subplots(ncols=len(radii), figsize=(len(radii) * 3, 3))
+        fig, axes = plt.subplots(ncols=3, nrows=2, figsize=(3 * 3, 3 * 2))
+        for idx, (irow, icol) in enumerate(product(range(2), range(3))):
+            if idx > 4:
+                break
+            ax = axes[irow, icol]
+            data_pth = Path(MODEL_OUT_PATH).joinpath(
+                'plot_data', f'{out_pth.name}_radius{radii[idx]}.npy'
+            )
+            if use_saved and data_pth.exists():
+                ydata = np.load(data_pth)
+            else:
+                rad_set = radii[idx:idx + 1]
+                dfr = df[df.radius.isin(rad_set)]
+                pdatas = [
+                    get_plot_data(
+                        dfr,
+                        [f'reg_preds_iter{it}'],
+                        percentiles,
+                        dnn_models=dnn_models,
+                    )
+                    for it in range(num_iters)
+                ]
+                human_mean_err = np.array([list(pdata.values())[0][1] for pdata in pdatas])
+                model_mean_errs = [
+                    np.array([list(pdata.values())[0][2 + i_mod] for pdata in pdatas])
+                    for i_mod in range(len(dnn_models))
+                ]
+                data_pth.parent.mkdir(parents=True, exist_ok=True)
+                # np.save(data_pth, human_mean_err)
+            h_mean = human_mean_err.mean(axis=0)
+            h_stderrs = human_mean_err.std(axis=0) / np.sqrt(num_iters)
+            ax.errorbar(
+                range(1, 5),
+                h_mean,
+                yerr=h_stderrs,
+                label='Human mean error'
+            )
+            for i_mod in range(len(dnn_models)):
+                m_mean = model_mean_errs[i_mod].mean(axis=0)
+                m_stderrs = model_mean_errs[i_mod].std(axis=0) / np.sqrt(num_iters)
+                ax.errorbar(
+                    range(1, 5),
+                    m_mean,
+                    yerr=m_stderrs,
+                    label=f'{dnn_models[i_mod]} mean error',
+                )
+            axes[1, 2].errorbar(
+                range(1, 5),
+                h_mean,
+                yerr=h_stderrs,
+                label=f'radius={radii[idx]}'
+            )
+            if err_interv is not None:
+                ax.hlines(err_interv[idx][0], 1, 4, linestyle='--')
+                ax.hlines(err_interv[idx][1], 1, 4, linestyle='--')
+            ax.set_title(f'Radius: {radii[idx]}')
+        axes[0, 0].legend()
+        axes[1, 0].set_xlabel('Predicted-difficulty quartile')
+        axes[1, 0].set_ylabel('Mean human error (deg)')
+        axes[1, 2].legend()
+        plt.tight_layout()
+        plt.savefig(out_pth)
+
+    df = get_visual_complexity_data(bin_size=bin_size, ext=ext)
+    tcc = TCCSceneWheel()
+    df_exp = tcc.human_data
+    df_exp['abs_error'] = df_exp.error.abs()
+
+    model_errs = {
+        'clip_RN50': tcc.get_or_load_TCC_samples(
+            np.argmax(tcc.models.name == 'clip_RN50_l24'),
+            4.23404255319149
+        )[1],
+        'clip_ViT-B16': tcc.get_or_load_TCC_samples(
+            np.argmax(tcc.models.name == 'clip_ViT-B16_l12'),
+            3.8191489361702127
+        )[1],
+        'vgg19': tcc.get_or_load_TCC_samples(
+            np.argmax(tcc.models.name == 'vgg19_l30'),
+            4.648936170212766
+        )[1],
+    }
+    bins = np.arange(0, 360 + 1, bin_size)
+    binaves = {}
+    for r in [2, 4, 8, 16, 32]:
+        binaves[r] = {
+            'clip_RN50': _get_binned_averages(
+                {
+                    key: val for key, val in model_errs['clip_RN50'].items()
+                    if key[1] == r
+                },
+                bins
+            ),
+            'clip_ViT-B16': _get_binned_averages(
+                {
+                    key: val for key, val in model_errs['clip_ViT-B16'].items()
+                    if key[1] == r
+                },
+                bins
+            ),
+            'vgg19': _get_binned_averages(
+                {
+                    key: val for key, val in model_errs['vgg19'].items()
+                    if key[1] == r
+                },
+                bins
+            ),
+        }
+    df['clip_RN50_mean_error'] = None
+    df['clip_ViT-B16_mean_error'] = None
+    df['vgg19_mean_error'] = None
+    for wid in range(1, 6):
+        for r in [2, 4, 8, 16, 32]:
+            for i, bin_left in enumerate(bins[:-1]):
+                df.loc[
+                    (df.bin_left == bin_left) & (df.wheel_id == wid) & (df.radius == r),
+                    'clip_RN50_mean_error'
+                ] = binaves[r]['clip_RN50'][i + 1]
+                df.loc[
+                    (df.bin_left == bin_left) & (df.wheel_id == wid) & (df.radius == r),
+                    'clip_ViT-B16_mean_error'
+                ] = binaves[r]['clip_ViT-B16'][i + 1]
+                df.loc[
+                    (df.bin_left == bin_left) & (df.wheel_id == wid) & (df.radius == r),
+                    'vgg19_mean_error'
+                ] = binaves[r]['vgg19'][i + 1]
+
+    # err_stds = df_exp.groupby('radius')['abs_error'].std()
+    err_interv = []
+    for n, vals in df_exp.groupby('radius')['abs_error']:
+        err_srt = np.sort(vals)
+        k = err_srt.size // 4
+        err_interv.append([err_srt[k], err_srt[-k]])
+    err_means = df_exp.groupby('radius')['abs_error'].mean()
+    percentiles = [0, 25, 50, 75, 100]
+    measures_set_full = [
+        'radius',
+        'mean_disk_size',
+        'vae_beta0.01',
+        'countr_estimate',
+        'keypoints_2d',
+        'keypoints_3d',
+        'seg_2d_mean',
+        'seg_25d_mean',
+        'vgg19_l4_mean_abs',
+        'vgg19_l8_mean_abs',
+        'vgg19_l17_mean_abs',
+        'vgg19_l26_mean_abs',
+        'vgg19_l33_mean_abs',
+        'vgg19_l35_mean_abs',
+        'vgg19_l4_spatial_entropy',
+        'vgg19_l8_spatial_entropy',
+        'vgg19_l17_spatial_entropy',
+        'vgg19_l26_spatial_entropy',
+        'vgg19_l33_spatial_entropy',
+        'vgg19_l35_spatial_entropy',
+    ]
+    measures_set = list(measures_set_full)  # Make a copy
+
+    # Heat-map of pairwise correlations between measures
+    y = np.empty((len(measures_set), len(measures_set)))
+    for i, m1 in enumerate(measures_set):
+        for j, m2 in enumerate(measures_set):
+            y[i, j] = spearmanr(df[m1], df[m2])[0]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.set_xticks([])
+    ax.set_xticklabels([])
+    ax.set_yticks(range(len(measures_set)))
+    ax.set_yticklabels(measures_set)
+    handle = ax.imshow(y, cmap='Blues')
+    plt.subplots_adjust(left=0.3)
+    fig.colorbar(handle, ax=ax)
+    plot_pth = Path('figures').joinpath(
+        'summary',
+        'scene_wheels',
+        f'feature_correlations.pdf'
+    )
+    plt.savefig(plot_pth)
+
+    # Multiple regression of mean human error against complexity measures
+    radii = [2, 4, 8]  # Fit regression model to these radii
+    df_train = df[df.radius.isin(radii)]
+    regression_data_pth = Path(
+        f'{MODEL_OUT_PATH}/regression_results_{reg_type}.json'
+    )
+
+    # Vanilla linear regression (doesn't account for circularity of data)
+    min_feat = 1
+    num_iters = 1000
+    reg_data = [
+        _do_sklearn_regression(df, df_train, min_feat=min_feat, iter_=i)
+        for i in range(num_iters)
+    ]
+    sample_idxs, rankings = list(zip(*reg_data))
+    rankings = np.array(rankings)
+    fig, ax = plt.subplots()
+    ax.bar(np.arange(rankings.shape[1]), (rankings == 1).sum(0) / num_iters)
+    ax.set_xticks(np.arange(rankings.shape[1]))
+    ax.set_xticklabels(measures_set, rotation=45, ha='right')
+    plot_pth = Path('figures').joinpath(
+        'summary',
+        'scene_wheels',
+        f'feature_keep_frequencies_min_feat{min_feat}.pdf'
+    )
+    plt.tight_layout()
+    plt.savefig(plot_pth)
+    plot_pth = Path('figures').joinpath(
+        'summary',
+        'scene_wheels',
+        f'load_sklearn_RFECV_min_feat{min_feat}.pdf'
+    )
+    _plot_reg_results(
+        plot_pth,
+        df,
+        # err_interv=err_interv,
+        # err_means=err_means.values,
+        radii=[2, 4, 8, 16, 32],
+        num_iters=num_iters,
+        use_saved=False,
+        dnn_models=['clip_RN50', 'clip_ViT-B16', 'vgg19'],
+    )
+    # print(rfe.ranking_)
+    # print([spearmanr(df[df.radius == r].reg_preds_iter0, df[df.radius == r].mean_error) for r in radii])
+
+    # Neural network regression
+    # n_to_leave_out = 8
+    # num_repeats = 50  # How many random split halves to take
+    # i_start = 0
+    # if regression_data_pth.exists():
+    #     # Resume from file
+    #     with regression_data_pth.open('r') as fid:
+    #         data_dict = json.load(fid)
+    #     for i in range(n_to_leave_out):
+    #         if str(i) not in data_dict.keys():
+    #             data_dict[str(i)] = {}
+    #         if data_dict[str(i)]:
+    #             i_start = i + 1
+    #             omit = data_dict[str(i)]['omitted_feature']
+    #             measures_set = [m for m in measures_set if m != omit]
+    # else:
+    #     # Start from scratch
+    #     data_dict = {str(i): {} for i in range(n_to_leave_out)}
+
+    # for iter_ in range(i_start, n_to_leave_out):
+    #     print(f'STARTING ITER {iter_}')
+    #     rhos = {}
+    #     rho_mean_max = -np.inf
+    #     for i in range(len(measures_set)):
+    #         # Leave-one-out
+    #         mset = [m for j, m in enumerate(measures_set) if j != i]
+    #         rhos[measures_set[i]] = [
+    #             experiment_iter(
+    #                 df_train, mset, shuffle_baseline=shuffle_baseline
+    #             )
+    #             for k in range(num_repeats)
+    #         ]
+    #         rho_mean = np.mean(rhos[measures_set[i]])
+    #         rho_std = np.std(rhos[measures_set[i]])
+    #         print(
+    #             f'Omit {measures_set[i]}: mean rho: {rho_mean},'
+    #             f' std rho: {rho_std}'
+    #         )
+    #         if rho_mean > rho_mean_max:
+    #             rho_mean_max = rho_mean
+    #             omit = measures_set[i]  # Next round, omit feature that we do best without
+    #         data_dict[str(iter_)][f'omit_{measures_set[i]}'] = {}
+    #         data_dict[str(iter_)][f'omit_{measures_set[i]}']['rho_mean'] = rho_mean
+    #         data_dict[str(iter_)][f'omit_{measures_set[i]}']['rho_std'] = rho_std
+    #     print(f'Iter {iter_ + 1}: Omitting {omit}, mean rho for iter: {np.mean(list(rhos.values()))}')
+    #     measures_set = [m for m in measures_set if m != omit]
+    #     data_dict[str(iter_)]['omitted_feature'] = omit
+    #     with Path(regression_data_pth).open('w') as fid:
+    #         json.dump(data_dict, fid)
+
+    # measures_set = list(measures_set_full)
+    # for iter_ in range(n_to_leave_out):
+    #     omit = data_dict[str(iter_)]['omitted_feature']
+    #     measures_set = [m for m in measures_set if m != omit]
+    #     # Make set-size plot with reduced feature set
+    #     _plot_nn(
+    #         iter_,
+    #         measures_set,
+    #         df,
+    #         df_train,
+    #         shuffle_baseline=shuffle_baseline
+    #     )
+
+    return
+
+
+def plot_taylor_bays_setsize(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+    pca=1,    
+):
+    pca_str = f'_pca{pca}' if pca < 1 else ''
+    df = pd.read_csv(data_pth)
+    df = df.sort_values(by=['setsize']).sort_index()
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    dfh = df[df.model_name == 'human']
+    # fig, ax = plt.subplots(ncols=len(model_classes), figsize=(3 * len(model_classes), 3))
+    fig, ax = plt.subplots(figsize=(3, 3))  # Single plot
+    if not hasattr(ax, '__len__'):
+        ax = [ax]
+    df_plot = pd.DataFrame({
+        'label': ['human'] * len(dfh.setsize),
+        'x': dfh.setsize,
+        'y': dfh.mean_abs_err,
+    })
+    ax[0].plot(dfh.setsize, dfh.mean_abs_err, label='human', linestyle='--')
+    # Version that plots only one line per model class
+    for i, mclass in enumerate(model_classes):
+        # Only plot curves corresponding to d' with highest likelihood across
+        # set-sizes (Note: I'm taking likelihood for each set size then
+        # averaging, to ensure that each set size counts equally.)
+        # axi = ax[i]  # One plot per model
+        axi = ax[0]  # Single plot
+        # axi.plot(dfh.setsize, dfh.mean_abs_err, label='human')
+        dfm = df[df.model_name.str.contains(mclass + '_l')]
+        best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
+        print(f"Log-lik ({mclass}): {dfm.groupby(['model_name', 'dprime'])['loglik'].mean().max()}")
+        dfm_best = dfm[(dfm.dprime == best_dp) & (dfm.model_name == best_layer)]
+        axi.plot(
+            dfm_best.setsize,
+            dfm_best.mean_abs_err,
+            label=f"{mclass}"
+        )
+        df_plot = pd.concat([
+            df_plot,
+            pd.DataFrame({
+                'label': [mclass] * len(dfm_best.setsize),
+                'x': dfm_best.setsize,
+                'y': dfm_best.mean_abs_err,
+            })
+        ])
+    axi.legend()
+    ax[0].set_xlabel('Set size')
+    ax[0].set_ylabel('Mean abs error')
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/taylor_bays/error_per_setsize{pca_str}.pdf')
+    return df_plot
+
+
+def plot_taylor_bays_sim_curves(
+    data_pth,
+    dataset,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+    pca=1,
+):
+    pca_str = f'_pca{pca}' if pca < 1 else ''
+    df = pd.read_csv(data_pth)
+    df = df.sort_values(by=['setsize']).sort_index()
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    fig, ax = plt.subplots(
+        ncols=len(model_classes),
+        figsize=(2.5 * len(model_classes), 3)
+    )
+    df_plot = pd.DataFrame({
+        'ss': [],
+        'model_class': [],
+        'x': [],
+        'y': [],
+    })
+    setsizes = [1, 2, 4, 8]
+    sims = {}
+    for i, mclass in enumerate(model_classes):
+        dfm = df[df.model_name.str.contains(mclass + '_l')]
+        best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
+        dfm_best = dfm[(dfm.dprime == best_dp) & (dfm.model_name == best_layer)]
+        sims[mclass] = {}
+        for ss in setsizes:
+            item_locs = None  # Even spacing
+            tcc = TCCBays(
+                ss,
+                model_classes=model_classes,
+                just_in_time_loading=True,
+                inherit_from=f'{dataset}_setsize1',
+            )
+            layer_idx = np.argmax(tcc.models.name == best_layer)
+            targets = [0] * ss
+            responses = [[0] * (ss - 1) + [i] for i in range(180)]
+            target_id = (tuple(targets), item_locs)
+            resp_ids = [(tuple(r), item_locs) for r in responses]
+            # Get model info
+            if mclass.startswith('clip_RN50'):
+                embed_func = clip_embed
+                img_size = 224
+                embed_args = (tcc.models.specs.values[layer_idx], 'RN50')
+            elif mclass.startswith('clip_ViT-B16'):
+                embed_func = clip_embed
+                img_size = 224
+                embed_args = (tcc.models.specs.values[layer_idx], 'ViT-B16')
+            elif mclass in ['vgg19', 'resnet50']:
+                embed_func = torchvision_embed
+                img_size = 224
+                embed_args = (tcc.models.specs.values[layer_idx], mclass)
+            else:
+                raise NotImplementedError()
+            # Compute model embeddings
+            Z = tcc._embed(
+                best_layer,
+                target_id,
+                resp_ids,
+                embed_func,
+                img_size,
+                *embed_args
+            )
+            print(f'Norm ({mclass}, ss={ss}): {np.linalg.norm(Z[0])}')
+            # Compute similarities
+            sims[mclass][ss] = cossim_torch(Z[0], Z[1:], dev=device).detach().cpu().numpy()
+            ax[i].plot(sims[mclass][ss], label=f'ss={ss}')
+            ax[i].set_title(f'{mclass}')
+            ax[i].set_xlabel(f'Response angle')
+            df_plot = pd.concat([
+                df_plot,
+                pd.DataFrame({
+                    'ss': [ss] * 180,
+                    'model_class': [mclass] * 180,
+                    'x': np.arange(0, 180),
+                    'y': sims[mclass][ss],
+                })
+            ])
+    ax[0].set_ylabel(f'Cosine similarity to target')
+    ax[1].legend()
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/taylor_bays/similarity_curves_by_setsize.pdf')
+    return df_plot
+
+
+def plot_taylor_bays_spearman_full(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+    pca=1,
+):
+    pca_str = f'_pca{pca}' if pca < 1 else ''
+    df = pd.read_csv(data_pth)
+    df = df.sort_values(by=['setsize']).sort_index()
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    fig, ax = plt.subplots(
+        nrows=len(model_classes),
+        ncols=len(np.unique(df.setsize)),
+        figsize=(len(np.unique(df.setsize)) * 2.5, 4.5 * len(model_classes)),
+        squeeze=False,
+    )
+    min_rho = df[f'spearman_r'].min()
+    for i, mclass in enumerate(model_classes):
+        dfm = df[df.model_name.str.contains(mclass)]
+        # Take best d' for each layer
+        best_dps = {
+            mname: dfm.groupby(['dprime'])['loglik'].mean().idxmax()
+            for mname, group in dfm.groupby('model_name')
+        }
+        dfm_best = pd.concat([
+            dfm[(dfm.model_name == mname) & (dfm.dprime == dp)]
+            for mname, dp in best_dps.items()
+        ])
+
+        # for j, ss in enumerate(['1', '2', '4', '8', 'all']):
+        for j, (ss, group) in enumerate(dfm_best.groupby('setsize')):
+            group = dfm_best[dfm_best.setsize == ss]
+            colors = [
+                'gray' if pval > 0.05 else 'b'
+                for pval in group[f'spearman_pval']
+            ]
+            ax[i][j].bar(
+                range(len(group)),
+                group[f'spearman_r'],
+                color=colors
+            )
+            ax[i][j].set_xticks([])
+            ax[i][j].set_xticklabels([])
+            ax[i][j].set_xlabel(f'{mclass} layers')
+            ax[i][j].set_ylim(min_rho - min_rho * 0.05, 1)
+            if i == 0:
+                ax[i][j].set_title(f'Set-size={int(ss)}')
+    ax[0, 0].set_ylabel('Spearman rho')
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/taylor_bays/spearman_bars{pca_str}.pdf')
+
+
+def plot_taylor_bays_spearman_condensed(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+    pca=1,
+):
+    pca_str = f'_pca{pca}' if pca < 1 else ''
+    df = pd.read_csv(data_pth)
+    df = df.sort_values(by=['setsize']).sort_index()
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    setsizes = [1, 2, 4, 8]
+    fig, ax = plt.subplots(
+        ncols=len(setsizes), figsize=(1.5 * len(setsizes), 4)
+    )
+    for i, ss in enumerate(setsizes):
+        ax[i].set_ylim(-0.5, 0.5)
+        ax[i].set_title(f'Set-size: {ss}')
+        ax[i].set_xticks(np.arange(len(model_classes)) * 0.5)
+        ax[i].set_xticklabels(model_classes, ha='right', rotation=45)
+        ax[i].spines[['right', 'top']].set_visible(False)
+        if i != 0:
+            ax[i].set_yticklabels([])
+    dfp = get_spearman_condensed_ss_plot_data(
+        df,
+        setsizes,
+        model_classes=model_classes,
+    )
+    for i in range(len(ax)):
+        dfpi = dfp[dfp.axis == i]
+        colors = [
+            'gray' if pval > 0.05 else 'b'
+            for pval in dfpi.pval
+        ]
+        ax[i].bar(dfpi.x, dfpi.y, width=0.25, label=dfpi.name, color=colors)
+    ax[0].set_ylabel('Spearman rho')
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/taylor_bays/spearman_bars_condensed.pdf')
+
+
+def plot_taylor_bays_quantiles(
+    data_pth,
+    dataset,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+    num_boot=1000,
+    pca=1,
+):
+    def bootstrap(dfh, num_boot, mclass):
+        model_bin_means = [
+            dfh.groupby('bins').sample(frac=1, replace=True).groupby('bins')[f'{mclass}_err'].mean()
+            for iboot in range(num_boot)
+        ]
+        human_bin_means = [
+            dfh.groupby('bins').sample(frac=1, replace=True).groupby('bins')['abs_error'].mean()
+            for iboot in range(num_boot)
+        ]
+        # Confidence intervals
+        m_boot_means = np.mean(model_bin_means, axis=0)
+        m_boot_lower = np.quantile(model_bin_means, q=0.05, axis=0)
+        m_boot_upper = np.quantile(model_bin_means, q=0.95, axis=0)
+        h_boot_means = np.mean(human_bin_means, axis=0)
+        h_boot_lower = np.quantile(human_bin_means, q=0.05, axis=0)
+        h_boot_upper = np.quantile(human_bin_means, q=0.95, axis=0)
+        return (
+            m_boot_means,
+            m_boot_lower,
+            m_boot_upper,
+            h_boot_means,
+            h_boot_lower,
+            h_boot_upper,
+        )
+
+    pca_str = f'_pca{pca}' if pca < 1 else ''
+    df = pd.read_csv(data_pth)
+    df = df.sort_values(by=['setsize']).sort_index()
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    setsizes = [1, 2, 4, 8]
+    num_quantiles = 4
+    dfh_all = []  # Collect data from all set-sizes
+    for ss in setsizes:
+        tcc = TCCBays(
+            ss,
+            model_classes=model_classes,
+            just_in_time_loading=True,
+            # max_mem=370,
+            inherit_from=f'{dataset}_setsize1',
+        )
+        fig, ax = plt.subplots(
+            ncols=len(model_classes),
+            figsize=(2.5 * len(model_classes), 3)
+        )
+        if not hasattr(ax, '__len__'):
+            ax = [ax]
+        dfh = tcc.human_data
+        dfh['abs_error'] = dfh.error.abs()
+        dfh['bins'] = pd.qcut(dfh.abs_error, num_quantiles)
+        # Get model errors for each trial and compute corresponding means
+        for i, mclass in enumerate(model_classes):
+            dfm = df[df.model_name.str.contains(mclass + '_l')]
+            best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
+            layer_idx = np.argmax(tcc.models.name == best_layer)
+            errs = tcc.sample_model_errors(best_dp, idxs=[layer_idx])[best_layer]
+            mean_abs_model_error = []
+            for j in range(len(dfh)):
+                key = tcc._get_key_from_idx(j)
+                mean_abs_model_error.append(np.abs(errs[key]).mean())
+            dfh[f'{mclass}_err'] = mean_abs_model_error
+            dfh_all.append(dfh)
+            x = bootstrap(dfh, num_boot, mclass)
+            (
+                m_boot_means,
+                m_boot_lower,
+                m_boot_upper,
+                h_boot_means,
+                h_boot_lower,
+                h_boot_upper,
+            ) = x
+            # print(f'Model: mean={m_boot_means}, lower={m_boot_lower}, upper={m_boot_upper}')
+            # print(f'Humans: mean={h_boot_means}, lower={h_boot_lower}, upper={h_boot_upper}')
+
+            # No bootstrap
+            # ax[i].plot(dfh.groupby('bins')[f'{mclass}_err'].mean(), human_qmeans)
+            # With bootstrap
+            ax[i].errorbar(
+                m_boot_means,
+                h_boot_means,
+                xerr=[m_boot_means - m_boot_lower, m_boot_upper - m_boot_means],
+                yerr=[h_boot_means - h_boot_lower, h_boot_upper - h_boot_means],
+            )
+            ax[i].set_title(f"{mclass}, d'={best_dp}")
+            print(f'Setsize: {ss}, ', best_layer, dfh[f'{mclass}_err'].mean())
+        ax[0].set_xlabel('Model mean abs error (deg)')
+        ax[0].set_ylabel('Human mean abs error (deg)')
+        plt.tight_layout()
+        plt.savefig(f'figures/summary/taylor_bays/error_quantiles_ss{ss}.pdf')
+
+    # Now bootstrap all set-sizes together
+    dfh_all = pd.concat(dfh_all)
+    dfh_all['bins'] = pd.qcut(dfh_all.abs_error, num_quantiles)
+    fig, ax = plt.subplots(
+        ncols=len(model_classes),
+        figsize=(2.5 * len(model_classes), 3)
+    )
+    if not hasattr(ax, '__len__'):
+        ax = [ax]
+    for i, mclass in enumerate(model_classes):
+        x = bootstrap(dfh_all, num_boot, mclass)
+        (
+            m_boot_means,
+            m_boot_lower,
+            m_boot_upper,
+            h_boot_means,
+            h_boot_lower,
+            h_boot_upper,
+        ) = x
+        ax[i].errorbar(
+            m_boot_means,
+            h_boot_means,
+            xerr=[m_boot_means - m_boot_lower, m_boot_upper - m_boot_means],
+            yerr=[h_boot_means - h_boot_lower, h_boot_upper - h_boot_means],
+        )
+        ax[i].set_title(f"{mclass}")
+    ax[0].set_xlabel('Model mean abs error (deg)')
+    ax[0].set_ylabel('Human mean abs error (deg)')
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/taylor_bays/error_quantiles_all_ss.pdf')
+
+
+def plot_taylor_bays_biases_by_layer(
+    data_pth,
+    dataset,
+    model_class='vgg19',
+    fixed_dprime=None,
+    layers=[8, 9, 10, 11],
+    setsize=1,
+    binsize=12,
+):
+    """
+    E.g., examine bias in early layers of VGG-19, which show human-like
+    repulsion, even if they are not the overall best-fit across all set sizes.
+    """
+    df = pd.read_csv(data_pth)
+    df = df.sort_values(by=['setsize']).sort_index()
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    tcc = TCCBays(
+        setsize,
+        model_classes=[model_class],
+        just_in_time_loading=True,
+        inherit_from=f'{dataset}_setsize1',
+    )
+    best_dps = []
+    for layer in layers:
+        dfm = df[df.model_name == model_class + f'_l{layer}']
+        best_dp = dfm.groupby('dprime')['loglik'].mean().idxmax()
+        best_dps.append(best_dp)
+    plot_error_bias(
+        tcc,
+        [model_class + f'_l{layer}' for layer in layers],
+        [fixed_dprime] * len(layers) if fixed_dprime else best_dps,
+        title_full_name=True,
+        tag='_layers_' + '_'.join([str(l) for l in layers])
+    )
+
+
+def plot_taylor_bays_biases(
+    data_pth,
+    dataset,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+):
+    df = pd.read_csv(data_pth)
+    df = df.sort_values(by=['setsize']).sort_index()
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    setsizes = [1, 2, 4, 8]
+    dfs_plot = []
+    for ss in setsizes:
+        tcc = TCCBays(
+            ss,
+            model_classes=model_classes,
+            just_in_time_loading=True,
+            inherit_from=f'{dataset}_setsize1',
+        )
+        best_layers = []
+        best_dps = []
+        for i, mclass in enumerate(model_classes):
+            dfm = df[df.model_name.str.contains(mclass + '_l')]
+            best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
+            best_layers.append(best_layer)
+            best_dps.append(best_dp)
+        df_plot = plot_error_bias(tcc, best_layers, best_dps)
+        dfs_plot.append(df_plot)
+    return dfs_plot
+
+
+def plot_taylor_bays(
+    data_pth,
+    dataset='bays2014',
+    model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19'],
+    binsize=12,
+    pca=1,
+    num_boot=1000,
+    analyses=[
+        'biases',
+        'spearman_full',
+        'spearman_condensed',
+        'quantiles',
+        'setsize',
+        'similarity_curves',
+        'setsize_and_similarity_curves',
+    ],
+):
+
+    # SETSIZE EFFECTS
+    # (Mean abs error per set-size)
+    if 'setsize' in analyses or 'setsize_and_similarity_curves' in analyses:
+        df_plot_ss = plot_taylor_bays_setsize(
+            data_pth,
+            model_classes=model_classes,
+            binsize=binsize,
+            pca=pca,
+        )
+
+    # Interrogate set-size effects further by comparing similarity curves for
+    # different set sizes
+    if 'similarity_curves' in analyses or 'setsize_and_similarity_curves' in analyses:
+        df_plot_sc = plot_taylor_bays_sim_curves(
+            data_pth,
+            dataset,
+            model_classes=model_classes,
+            binsize=binsize,
+            pca=pca,
+        )
+
+    if 'setsize_and_similarity_curves' in analyses:
+        # Combine data into one plot
+        fig, ax = plt.subplots(
+            ncols=len(model_classes) + 1,
+            figsize=(3 * (len(model_classes) + 1) + 0.1, 3)
+        )
+        # Setsize in first plot
+        dfph = df_plot_ss[df_plot_ss.label == 'human']
+        ax[0].plot(dfph.x, dfph.y, label='human', linestyle='--')
+        for mc in model_classes:
+            dfp = df_plot_ss[df_plot_ss.label == mc]
+            ax[0].plot(dfp.x, dfp.y, label=mc)
+        ax[0].set_xlabel('Set size')
+        ax[0].set_ylabel('Mean abs. error')
+        ax[0].legend()
+        # Sim curves in remaining plots
+        for i, mc in enumerate(model_classes):
+            for ss in df_plot_sc.ss.unique():
+                dfp = df_plot_sc[
+                    (df_plot_sc.model_class == mc) & (df_plot_sc.ss == ss)
+                ]
+                ax[i + 1].plot(dfp.x, dfp.y, label=f'ss={ss}')
+            ax[i + 1].set_xlabel('Response angle')
+            ax[i + 1].set_title(f'{mc}')
+        ax[1].set_ylabel('Cosine similarity to target')
+        ax[2].legend()
+        plt.tight_layout()
+        plt.savefig(f'figures/summary/taylor_bays/setsize_combined.pdf')
+
+    # Plot biases
+    if 'biases' in analyses:
+        plot_taylor_bays_biases(
+            data_pth,
+            dataset,
+            model_classes=model_classes,
+            binsize=binsize,
+            num_boot=num_boot,
+            pca=pca,
+        )
+
+    # Spearman rank analysis
+    if 'spearman_full' in analyses:
+        plot_taylor_bays_spearman_full(
+            data_pth,
+            model_classes=model_classes,
+            binsize=binsize,
+            pca=pca,
+        )
+
+    # Condensed version
+    if 'spearman_condensed' in analyses:
+        plot_taylor_bays_spearman_condensed(
+            data_pth,
+            model_classes=model_classes,
+            binsize=binsize,
+            pca=pca,
+        )
+
+    # Re-plot using error quantiles
+    if 'quantiles' in analyses:
+        plot_taylor_bays_quantiles(
+            data_pth,
+            dataset,
+            model_classes=model_classes,
+            binsize=binsize,
+            num_boot=num_boot,
+            pca=pca,
+        )
+    return
+
+
+def plot_error_bias(
+    tcc, model_names, dprimes, title_full_name=False, tag=''
+):
+    def _get_mean_errs(errs_dict):
+        errs_per_targ = {}  # Bin by angle
+        for key, errs_stim_i in errs_dict.items():
+            target = key[-1]
+            if target not in errs_per_targ:
+                errs_per_targ[target] = np.array(errs_stim_i).reshape(-1)
+            else:
+                errs_per_targ[target] = np.concatenate([
+                    errs_per_targ[target],
+                    np.array(errs_stim_i).reshape(-1)
+                ])
+        targets = [k[-1] for k in errs_dict.keys()]
+        errs_mean = [np.mean(errs_per_targ[t]) for t in targets]
+        return targets, errs_mean
+
+    herrs_dict = tcc.get_human_errors_by_key()
+    fig, axs = plt.subplots(
+        nrows=len(dprimes) + 1, figsize=(6, 2 * (len(dprimes) + 1))
+    )
+    if not hasattr(axs, '__len__'):
+        axs = [axs]
+    df_plot = pd.DataFrame({
+        'dataset': [],
+        'model_class': [],
+        'x': [],
+        'y': [],
+        'colors': [],
+    })
+    for ax, mname, dp in zip(axs, model_names, dprimes):
+        mclass = f"{mname.split('_l')[0]}"
+        idx = np.argmax(tcc.models.name.values == mname)
+        errs_dict = tcc.sample_model_errors(dp, idxs=[idx])[mname]
+        targets, errs_mean = _get_mean_errs(errs_dict)
+        if tcc.dataset == 'brady_alvarez':
+            colors = [
+                rgb_from_angle(
+                    hue * np.pi / 180,
+                    lab_center=tcc.lab_center,
+                    radius=tcc.lab_radius
+                )
+                for hue in targets
+            ]
+        else:
+            colors = None
+        ax.scatter(targets, errs_mean, c=colors)
+        if title_full_name:
+            ax.set_title(f'{mname}')
+        else:
+            ax.set_title(mclass)
+        df_plot = pd.concat([
+            df_plot,
+            pd.DataFrame({
+                'dataset': [tcc.dataset] * len(targets),
+                'model_class': [mclass] * len(targets),
+                'x': targets,
+                'y': errs_mean,
+                'colors': colors or [None] * len(targets),
+            })
+        ])
+    htargets, herrs_mean = _get_mean_errs(herrs_dict)
+    df_plot = pd.concat([
+        df_plot,
+        pd.DataFrame({
+            'dataset': [tcc.dataset] * len(htargets),
+            'model_class': ['humans'] * len(htargets),
+            'x': htargets,
+            'y': herrs_mean,
+            'colors': colors or [None] * len(targets),
+        })
+    ])
+    axs[-1].scatter(htargets, herrs_mean, c=colors)
+    axs[-1].set_title('human')
+    axs[-1].set_xlabel('Stimulus angle (deg)')
+    axs[-1].set_ylabel('Error (deg)')
+    plt.tight_layout()
+    if 'bays' in tcc.dataset:
+        dataset = 'taylor_bays'
+    else:
+        dataset = 'brady_alvarez'
+    save_pth = Path(
+        f'figures/summary/{dataset}/{tcc.item_type}_biases_ss{tcc.setsize}{tag}.pdf'
+    )
+    save_pth.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_pth)
+    return df_plot
+
+
+def get_spearman_condensed_ss_plot_data(
+    df,
+    setsizes,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+):
+    dfp = pd.DataFrame({
+        'axis': [],
+        'name': [],
+        'x': [],
+        'y': [],
+        'pval': [],
+    })
+    for i, mclass in enumerate(model_classes):
+        dfm = df[df.model_name.str.contains(mclass + '_l')]
+        best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
+        dfm_best = dfm[(dfm.dprime == best_dp) & (dfm.model_name == best_layer)]
+        for j, ss in enumerate(setsizes):
+            x = [i * 0.5]
+            y = dfm_best[dfm_best.setsize == ss].spearman_r
+            pval = dfm_best[dfm_best.setsize == ss].spearman_pval
+            dfp = pd.concat([
+                dfp,
+                pd.DataFrame({
+                    'axis': [j],
+                    'name': best_layer,
+                    'x': x,
+                    'y': y,
+                    'pval': pval,
+                })
+            ])
+    return dfp
+
+
+def plot_brady_spearman_full(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+):
+    df = pd.read_csv(data_pth)
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    fig, ax = plt.subplots(
+        ncols=len(model_classes),
+        figsize=(4.5 * len(model_classes), 5)
+    )
+    if not hasattr(ax, '__len__'):
+        ax = [ax]
+    for i, mclass in enumerate(model_classes):
+        dfm = df[df.model_name.str.contains(mclass + '_l')]
+        colors = [
+            'gray' if pval > 0.05 else 'b' for pval in dfm.spearman_pval
+        ]
+        # Get best-fit d' for each layer
+        dfm = dfm.loc[dfm.groupby('model_name')['loglik'].idxmax()]
+        layer_idxs = np.array([
+            int(n.split('_')[-1][1:]) for n in dfm.model_name.values
+        ])
+        isort = np.argsort(layer_idxs)
+        ax[i].bar(
+            range(len(dfm)),
+            dfm.spearman_r.values[isort],
+            color=colors,
+        )
+        ax[i].set_xticks([])
+        ax[i].set_xticklabels([])
+        ax[i].set_xlabel(f'layers')
+        ax[i].set_ylim(-0.6, 0.8)
+        ax[i].set_title(f'{mclass}')
+    ax[0].set_ylabel('Spearman rho')
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/brady_alvarez/spearman_bars.pdf')
+
+
+def plot_bias_color_orientation(
+    data_pth0,
+    data_pth1,
+    binsize=12,
+    model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19'],
+):
+    # Plot by layer
+    plot_taylor_bays_biases_by_layer(
+        data_pth0,
+        'bays2014',
+        model_class='vgg19',
+        binsize=binsize,
+        # fixed_dprime=5.0,
+    )
+
+    df_plot_orient = plot_taylor_bays_biases(
+        data_pth0,
+        'bays2014',
+        model_classes=model_classes,
+        binsize=binsize,
+    )[0]
+    df_plot_color = plot_brady_biases(
+        data_pth1,
+        model_classes=model_classes,
+        binsize=binsize,
+    )
+    fig, ax = plt.subplots(
+        nrows=len(model_classes) + 1,
+        ncols=2,
+        figsize=(9, 2.2 * (len(model_classes) + 1))
+    )
+    for i, mc in enumerate(model_classes):
+        dfpo = df_plot_orient[df_plot_orient.model_class == mc]
+        if dfpo.colors.values[0] is None:
+            colors = None
+        else:
+            colors = dfpo.colors
+        ax[i][0].scatter(dfpo.x, dfpo.y, c=colors)
+        ax[i][0].set_title(mc)
+    dfpo = df_plot_orient[df_plot_orient.model_class == 'humans']
+    ax[-1][0].scatter(dfpo.x, dfpo.y, c=colors)
+    ax[-1][0].set_title('humans')
+    for i, mc in enumerate(model_classes):
+        dfpc = df_plot_color[df_plot_color.model_class == mc]
+        ax[i][1].scatter(dfpc.x, dfpc.y, c=dfpc.colors)
+        ax[i][1].set_title(mc)
+    ax[-1][0].set_xlabel('Response angle (deg)')
+    ax[-1][0].set_ylabel('Mean error (deg)')
+    dfpc = df_plot_color[df_plot_color.model_class == 'humans']
+    ax[-1][1].scatter(dfpc.x, dfpc.y, c=dfpc.colors)
+    ax[-1][1].set_title('humans')
+    plt.tight_layout()
+    save_pth = Path(f'figures/summary/biases_combined_ss1.pdf')
+    save_pth.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_pth)
+    return
+
+
+def plot_ss_spearman_condensed(
+    data_pth0,
+    data_pth1,
+    binsize=12,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+):
+    """
+    Plot both color and orientation results in single figure
+    """
+    # Orientation
+    df0 = pd.read_csv(data_pth0)
+    df0 = df0.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    dfp0 = get_spearman_condensed_ss_plot_data(
+        df0, [1, 2, 4, 8], model_classes=model_classes,
+    )
+    # Color
+    df1 = pd.read_csv(data_pth1)
+    df1 = df1.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    dfp1 = get_spearman_condensed_ss_plot_data(
+        df1, [3], model_classes=model_classes,
+    )
+    fig, ax = plt.subplots(ncols=5, figsize=(1.5 * 5, 4))
+    dfp1['axis'] += 4
+    dfp = pd.concat([dfp0, dfp1])
+    exp_names = ['Orient.'] * 4 + ['Color']
+    for i, ss in enumerate([1, 2, 4, 8, 3]):
+        ax[i].set_ylim(-0.5, 0.5)
+        ax[i].set_title(f'{exp_names[i]} SS {ss}')
+        ax[i].set_xticks(np.arange(len(model_classes)) * 0.5)
+        ax[i].set_xticklabels(model_classes, ha='right', rotation=45)
+        ax[i].spines[['right', 'top']].set_visible(False)
+        if i != 0:
+            ax[i].set_yticklabels([])
+    for i in range(len(ax)):
+        dfpi = dfp[dfp.axis == i]
+        colors = [
+            'gray' if pval > 0.05 else 'b'
+            for pval in dfpi.pval
+        ]
+        ax[i].bar(dfpi.x, dfpi.y, width=0.25, color=colors)
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/spearman_bars_condensed.pdf')
+
+
+def plot_brady_spearman_condensed(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+):
+    df = pd.read_csv(data_pth)
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+
+    setsizes = [3]
+    dfp = get_spearman_condensed_ss_plot_data(
+        df, setsizes, model_classes=model_classes,
+    )
+    fig, ax = plt.subplots(
+        ncols=len(setsizes), figsize=(1.5 * len(setsizes), 4)
+    )
+    if not hasattr(ax, '__len__'):
+        ax = [ax]
+    for i, ss in enumerate(setsizes):
+        ax[i].set_ylim(-0.5, 0.5)
+        ax[i].set_title(f'Set-size: {ss}')
+        ax[i].set_xticks(np.arange(len(model_classes)) * 0.5)
+        ax[i].set_xticklabels(model_classes, ha='right', rotation=45)
+        ax[i].spines[['right', 'top']].set_visible(False)
+        if i != 0:
+            ax[i].set_yticklabels([])
+    for i in range(len(ax)):
+        dfpi = dfp[dfp.axis == i]
+        colors = [
+            'gray' if pval > 0.05 else 'b'
+            for pval in dfpi.pval
+        ]
+        ax[i].bar(dfpi.x, dfpi.y, width=0.25, label=dfpi.name, color=colors)
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/brady_alvarez/spearman_bars_condensed.pdf')
+
+
+def plot_brady_biases(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+):
+    df = pd.read_csv(data_pth)
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    tcc = TCCBrady(
+        3,
+        model_classes=model_classes,
+        just_in_time_loading=True,
+        max_mem=370,
+    )
+    best_layers, best_dps = get_best_fit_models(
+        data_pth,
+        model_classes=model_classes,
+        binsize=12,
+        verbose=False,
+    )
+    df_plot = plot_error_bias(tcc, best_layers, best_dps)
+    return df_plot
+
+
+def plot_brady_sim_curves(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+):
+    df = pd.read_csv(data_pth)
+    df = df.sort_values(by=['setsize']).sort_index()
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    fig, ax = plt.subplots(
+        ncols=len(model_classes),
+        figsize=(2.5 * len(model_classes), 3)
+    )
+    df_plot = pd.DataFrame({
+        'ss': [],
+        'model_class': [],
+        'x': [],
+        'y': [],
+    })
+    setsizes = [3]
+    sims = {}
+    for i, mclass in enumerate(model_classes):
+        dfm = df[df.model_name.str.contains(mclass + '_l')]
+        best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
+        dfm_best = dfm[(dfm.dprime == best_dp) & (dfm.model_name == best_layer)]
+        sims[mclass] = {}
+        for ss in setsizes:
+            item_locs = None  # Even spacing
+            tcc = TCCBrady(
+                ss,
+                model_classes=model_classes,
+                just_in_time_loading=True,
+            )
+            layer_idx = np.argmax(tcc.models.name == best_layer)
+            targets = [0] * ss
+            responses = [[0] * (ss - 1) + [i] for i in range(360)]
+            target_id = (tuple(targets), item_locs)
+            resp_ids = [(tuple(r), item_locs) for r in responses]
+            # Get model info
+            if mclass.startswith('clip_RN50'):
+                embed_func = clip_embed
+                img_size = 224
+                embed_args = (tcc.models.specs.values[layer_idx], 'RN50')
+            elif mclass.startswith('clip_ViT-B16'):
+                embed_func = clip_embed
+                img_size = 224
+                embed_args = (tcc.models.specs.values[layer_idx], 'ViT-B16')
+            elif mclass in ['vgg19', 'resnet50']:
+                embed_func = torchvision_embed
+                img_size = 224
+                embed_args = (tcc.models.specs.values[layer_idx], mclass)
+            else:
+                raise NotImplementedError()
+            # Compute model embeddings
+            Z = tcc._embed(
+                best_layer,
+                target_id,
+                resp_ids,
+                embed_func,
+                img_size,
+                *embed_args
+            )
+            # Compute similarities
+            sims[mclass][ss] = cossim_torch(Z[0], Z[1:], dev=device).detach().cpu().numpy()
+            ax[i].plot(sims[mclass][ss], label=f'ss={ss}')
+            ax[i].set_title(f'{mclass}')
+            ax[i].set_xlabel(f'Response angle')
+            df_plot = pd.concat([
+                df_plot,
+                pd.DataFrame({
+                    'ss': [ss] * 360,
+                    'model_class': [mclass] * 360,
+                    'x': np.arange(0, 360),
+                    'y': sims[mclass][ss],
+                })
+            ])
+    ax[0].set_ylabel(f'Cosine similarity to target')
+    ax[1].legend()
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/brady_alvarez/similarity_curves_by_setsize.pdf')
+    return df_plot
+
+
+def plot_brady_quantiles(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    num_boot=1000,
+    binsize=12,
+):
+    df = pd.read_csv(data_pth)
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    tcc = TCCBrady(
+        3,
+        model_classes=model_classes,
+        just_in_time_loading=True,
+        max_mem=370,
+    )
+
+    fig, ax = plt.subplots(
+        ncols=len(model_classes),
+        figsize=(2.5 * len(model_classes), 3)
+    )
+    if not hasattr(ax, '__len__'):
+        ax = [ax]
+    num_quantiles = 4
+    dfh = tcc.human_data
+    dfh['abs_error'] = dfh.error.abs()
+    dfh['bins'] = pd.qcut(dfh.abs_error, num_quantiles)
+    # human_qmeans = dfh.groupby('bins')['abs_error'].mean()
+    # Get model errors for each trial and compute corresponding means
+    for i, mclass in enumerate(model_classes):
+        dfm = df[df.model_name.str.contains(mclass + '_l')]
+        best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
+        layer_idx = np.argmax(tcc.models.name == best_layer)
+        errs = tcc.sample_model_errors(best_dp, idxs=[layer_idx])[best_layer]
+
+        mean_abs_model_error = []
+        for j in range(len(dfh)):
+            key = tcc._get_key_from_idx(j)
+            mean_abs_model_error.append(np.abs(errs[key]).mean())
+        dfh[f'{mclass}_err'] = mean_abs_model_error
+
+        model_bin_means = [
+            dfh.groupby('bins').sample(frac=1, replace=True).groupby('bins')[f'{mclass}_err'].mean()
+            for iboot in range(num_boot)
+        ]
+        human_bin_means = [
+            dfh.groupby('bins').sample(frac=1, replace=True).groupby('bins')['abs_error'].mean()
+            for iboot in range(num_boot)
+        ]
+        # Confidence intervals
+        m_boot_means = np.mean(model_bin_means, axis=0)
+        m_boot_lower = np.quantile(model_bin_means, q=0.05, axis=0)
+        m_boot_upper = np.quantile(model_bin_means, q=0.95, axis=0)
+        h_boot_means = np.mean(human_bin_means, axis=0)
+        h_boot_lower = np.quantile(human_bin_means, q=0.05, axis=0)
+        h_boot_upper = np.quantile(human_bin_means, q=0.95, axis=0)
+        print(f'Model: mean={m_boot_means}, lower={m_boot_lower}, upper={m_boot_upper}')
+        print(f'Humans: mean={h_boot_means}, lower={h_boot_lower}, upper={h_boot_upper}')
+
+        # No bootstrap
+        # ax[i].plot(dfh.groupby('bins')[f'{mclass}_err'].mean(), human_qmeans)
+        # With bootstrap
+        ax[i].errorbar(
+            m_boot_means,
+            h_boot_means,
+            xerr=[m_boot_means - m_boot_lower, m_boot_upper - m_boot_means],
+            yerr=[h_boot_means - h_boot_lower, h_boot_upper - h_boot_means],
+        )
+        # ax[i].set_title(f"{mclass}, d'={best_dp}")
+        ax[i].set_title(f"{mclass}")
+    ax[0].set_xlabel('Model mean abs error (deg)')
+    ax[0].set_ylabel('Human mean abs error (deg)')
+    plt.tight_layout()
+    plt.savefig('figures/summary/brady_alvarez/error_quantiles.pdf')
+
+
+def do_brady_hierarchical(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+):
+    df = pd.read_csv(data_pth)
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    tcc = TCCBrady(
+        3,
+        model_classes=model_classes,
+        just_in_time_loading=True,
+        max_mem=370,
+    )
+    # fig, ax = plt.subplots(
+    #     ncols=len(model_classes),
+    #     figsize=(2.5 * len(model_classes), 3)
+    # )
+    # if not hasattr(ax, '__len__'):
+    #     ax = [ax]
+    rhos = {m: [] for m in model_classes}
+    num_stims = 50  # Num random stimuli to generate
+    num_samp = 100  # Num responses sampled per stimulus
+    for i, mclass in enumerate(model_classes):
+        dfm = df[df.model_name.str.contains(mclass + '_l')]
+        best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
+        layer_idx = np.argmax(tcc.models.name == best_layer)
+        item_locs = (0. + 90., 120. + 90., 240. + 90.)  # Must be type float
+        target_hues_list = []
+        resp_hues_list = []
+        for _ in tqdm(range(num_stims)):
+            # Sample random stimulus values
+            target_hues = np.random.choice(360, size=3)
+            # Get response options that fit criteria (i.e. large errors on all
+            # three items)
+            responses0 = product(np.arange(360)[::16], repeat=3)
+            responses = []
+            for resp in responses0:
+                diff = np.abs(standardize_angles(
+                    np.array(resp) - target_hues, deg=True
+                ))
+                if np.all(diff > 45):  # Error threshold of 45 deg
+                    responses.append(resp)
+
+            # Get model info
+            if mclass.startswith('clip_RN50'):
+                embed_func = clip_embed
+                img_size = 224
+                embed_args = (tcc.models.specs.values[layer_idx], 'RN50')
+            elif mclass in ['vgg19', 'resnet50']:
+                embed_func = torchvision_embed
+                img_size = 224
+                embed_args = (tcc.models.specs.values[layer_idx], mclass)
+            elif mclass.startswith('clip_ViT-B16'):
+                embed_func = clip_embed
+                img_size = 224
+                embed_args = (tcc.models.specs.values[layer_idx], 'ViT-B16')
+            else:
+                raise NotImplementedError()
+            # Compute keys (unique identifiers) for each stimulus to pass to
+            # functions for computing similarities
+            target_id = (tuple(target_hues), item_locs)
+            resp_ids = [(tuple(r), item_locs) for r in responses]
+            # Compute model embeddings
+            Z = tcc._embed(
+                best_layer,
+                target_id,
+                resp_ids,
+                embed_func,
+                img_size,
+                *embed_args
+            )
+            # Compute similarities
+            sims = cossim_torch(Z[0], Z[1:], dev='cpu').detach().cpu().numpy()
+            # Sample responses
+            resp_idx = sample_TCC(sims, best_dp, N=num_samp)
+            resp_hues_list.extend(np.array([responses[r] for r in resp_idx]))
+            target_hues_list.extend(
+                [target_hues.copy() for n in range(num_samp)]
+            )
+        # Get correlation between variances
+        resp_hues_vars = [circvar(r) for r in resp_hues_list]
+        target_hues_vars = [circvar(t) for t in target_hues_list]
+        np.save(
+            f'{DATA_STORAGE}/data_tcc/setsize_analysis/brady_alvarez/{mclass}_resp_hues_vars.npy',
+            np.array(resp_hues_vars)
+        )
+        np.save(
+            f'{DATA_STORAGE}/data_tcc/setsize_analysis/brady_alvarez/{mclass}_target_hues_vars.npy',
+            np.array(target_hues_vars)
+        )
+        print(
+            f'Response hues vs. stimulus hues variances ({mclass}):'
+            f' {spearmanr(resp_hues_vars, target_hues_vars)}'
+        )
+        tcc.embeddings_cache = {}
+
+        # ax[i].scatter(target_hues_vars, resp_hues_vars)
+        # ax[i].set_title(f'{mclass}')
+        # ax[i].set_xlabel('Circ. var. of stimulus hues')
+        # ax[i].set_ylabel('Circ. var. of response hues')
+    # plt.tight_layout()
+    # out_pth = Path(
+    #     'figures/summary/brady_alvarez/resp_var_vs_stim_var_scatter.pdf'
+    # )
+    # out_pth.parent.mkdir(parents=True, exist_ok=True)
+    # plt.savefig(out_pth)
+
+
+def get_best_fit_models(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    binsize=12,
+    verbose=False,
+    return_df=False,
+):
+    df = pd.read_csv(data_pth)
+    if 'radius' in df.columns:
+        df = df.loc[df.radius == 'all']
+    # summary_pths = Path(data_pth).glob('summary_data_*.csv')
+    # df = pd.concat([pd.read_csv(pth) for pth in summary_pths])
+    # df = pd.concat([
+    #     # Only include ones we want
+    #     df.loc[df.model_name.str.startswith(f'{m}_l')] for m in model_classes
+    # ])
+    df = df.rename(
+        columns={
+            f'spearman_r_binsize{binsize}': 'spearman_r',
+            f'spearman_pval_binsize{binsize}': 'spearman_pval',
+        }
+    )
+    # Check that grid search over d' was big enough
+    dfm = df[df.model_name != 'human']
+
+    for mname in dfm.model_name.unique():
+        dfi = df[df.model_name == mname]
+        if 'scene_wheels' in str(data_pth):
+            max_dp = 20
+        elif 'brady' in str(data_pth):
+            max_dp = 20
+        elif 'bays' in str(data_pth):
+            if mname.startswith('clip_RN50'):
+                max_dp = 1000
+            elif mname.startswith('clip_ViT-B16'):
+                max_dp = 1000
+            elif mname.startswith('vgg19'):
+                max_dp = 100
+        else:
+            raise NotImplementedError()
+        best_dp = dfi.iloc[dfi.loglik.argmax()].dprime
+        if best_dp >= max_dp:
+            print(f'Best d-prime not found for {mname} in {data_pth}')
+
+    best_layers = []
+    best_dps = []
+    for i, mclass in enumerate(model_classes):
+        dfm = df[df.model_name.str.contains(mclass + '_l')]
+        best_layer, best_dp = dfm.groupby(
+            ['model_name', 'dprime']
+        )['loglik'].mean().idxmax()
+        best_layers.append(best_layer)
+        best_dps.append(best_dp)
+        if verbose:
+            print(f'Best model for {mclass}: layer {best_layer}, dprime={best_dp}')
+    if return_df:
+        return best_layers, best_dps, df
+    else:
+        return best_layers, best_dps
+
+
+def plot_brady(
+    data_pth,
+    model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    num_boot=1000,
+    binsize=12,
+    analyses=[
+        'biases',
+        'spearman_full',
+        'spearman_condensed',
+        'quantiles',
+        'hierarchical',
+        'similarity_curves',
+    ],
+):
+    # Print info about best overall layers and d's
+    get_best_fit_models(
+        data_pth,
+        model_classes=model_classes,
+        binsize=12,
+        verbose=True,
+    )
+
+    if 'spearman_full' in analyses:
+        # Spearman rank analysis
+        plot_brady_spearman_full(
+            data_pth,
+            model_classes=model_classes,
+            binsize=12,
+        )
+
+    # Condensed version
+    if 'spearman_condensed' in analyses:
+        plot_brady_spearman_condensed(
+            data_pth,
+            model_classes=model_classes,
+            binsize=binsize,
+        )
+    
+    if 'quantiles' in analyses:
+        # Re-plot using error quantiles
+        plot_brady_quantiles(
+            data_pth,
+            model_classes=model_classes,
+            num_boot=num_boot,
+            binsize=binsize,
+        )
+
+    if 'biases' in analyses:
+        plot_brady_biases(
+            data_pth,
+            model_classes=model_classes,
+            binsize=binsize,
+        )
+
+    if 'similarity_curves' in analyses:
+        plot_brady_sim_curves(
+            data_pth,
+            model_classes=model_classes,
+            binsize=binsize,
+        )
+
+    # Humans respond with higher-variance choices when display is higher
+    # variance, even when they are completely wrong. Do models do the same?
+    # Approach 1: Replicate analysis in paper. For each unique display,
+    # enumerate all response options for the three items, and consider the
+    # subset for which error on all three items is at least 45 degrees. Then
+    # take samples and measure the correlation between the variance across the
+    # three hues in responses vs target display.
+    if 'hierarchical' in analyses:
+        do_brady_hierarchical(
+            data_pth,
+            model_classes=model_classes,
+            binsize=binsize,
+        )
+
+    # # Humans respond with higher-variance choices when display is higher
+    # # variance, even when they are completely wrong. Do models do the same?
+    # # Approach 2: Ask first-order question: Do model choices for a particular
+    # # probed item vary as a function of choices for the other items? Measure
+    # # this by computing spearman rank correlations between similarity scores of
+    # # the response options, while varying the values of the non-probed items.
+    # # A high correlation means that the model will tend to still prefer the
+    # # same responses, independent of its choices for the other items.
+    # fig, ax = plt.subplots(
+    #     ncols=len(model_classes),
+    #     figsize=(2.5 * len(model_classes), 3)
+    # )
+    # if not hasattr(ax, '__len__'):
+    #     ax = [ax]
+    # rhos = {m: [] for m in model_classes}
+    # for i, mclass in enumerate(model_classes):
+    #     dfm = df[df.model_name.str.contains(mclass + '_l')]
+    #     best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
+    #     layer_idx = np.argmax(tcc.models.name == best_layer)
+    #     item_locs = (0. + 90., 120. + 90., 240. + 90.)  # Must be type float
+    #     num_stims = 100
+    #     for _ in tqdm(range(num_stims)):
+    #         # Sample random stimulus values
+    #         target_hues = np.random.choice(360, size=3)
+    #         idx_probe = np.random.choice(3)  # Probed location
+    #         idx_nonprobe = [j for j in range(3) if j != idx_probe]  # Other locations
+    #         # Get response choice scores assuming non-probed items are set to
+    #         # their correct values
+    #         choices_matched = []
+    #         for a in range(360):
+    #             c = target_hues.copy()
+    #             c[idx_probe] = a
+    #             choices_matched.append(c)
+    #         # Get response choice scores assuming non-probed items are set to
+    #         # randomly chosen values
+    #         choices_rand = []
+    #         c = np.random.choice(360, size=3)
+    #         for a in range(360):
+    #             c[idx_probe] = a
+    #             choices_rand.append(c.copy())
+    #         # Get model info
+    #         if mclass.startswith('clip_RN50'):
+    #             embed_func = clip_embed
+    #             img_size = 224
+    #             embed_args = (tcc.models.specs.values[layer_idx], 'RN50')
+    #         elif mclass in ['vgg19', 'resnet50']:
+    #             embed_func = torchvision_embed
+    #             img_size = 224
+    #             embed_args = (tcc.models.specs.values[layer_idx], mclass)
+    #         else:
+    #             raise NotImplementedError()
+    #         # Compute keys (unique identifiers) for each stimulus to pass to
+    #         # functions for computing similarities
+    #         target_id = (tuple(target_hues), item_locs)
+    #         choice_ids_matched = [(tuple(c), item_locs) for c in choices_matched]
+    #         choice_ids_rand = [(tuple(c), item_locs) for c in choices_rand]
+    #         # Compute model embeddings
+    #         Z_matched = tcc._embed(
+    #             mclass + f'_l{best_layer}',
+    #             target_id,
+    #             choice_ids_matched,
+    #             embed_func,
+    #             img_size,
+    #             *embed_args
+    #         )
+    #         Z_rand = tcc._embed(
+    #             mclass + f'_l{best_layer}',
+    #             target_id,
+    #             choice_ids_rand,
+    #             embed_func,
+    #             img_size,
+    #             *embed_args
+    #         )
+    #         # Compute similarities
+    #         sims_matched = cossim_torch(
+    #             Z_matched[0], Z_matched[1:]
+    #         ).detach().cpu().numpy()
+    #         sims_rand = cossim_torch(
+    #             Z_rand[0], Z_rand[1:]
+    #         ).detach().cpu().numpy()
+    #         rhos[mclass].append(spearmanr(sims_matched, sims_rand)[0])
+    #     print(f'Mean rho (model {mclass}): {np.mean(rhos[mclass])}')
+    #     print(f'Min rho (model {mclass}): {np.min(rhos[mclass])}')
+    #     print(f'STD rho (model {mclass}): {np.std(rhos[mclass])}')
+    #     tcc.embeddings_cache = {}
+    # from ipdb import set_trace; set_trace()
+
+    # Approach 3: generate new stimuli which are tailored to assessing this
+    # question directly. Specifically, generate set-size 3 stimuli for which
+    # the hues are evenly spaced. Then, generate possible response
+    # alternatives where two of the hues remain fixed and one is varied. The
+    # fixed hues are located exactly equidistant to their two closest target
+    # values, while the third one varies all the way around the circle. We can
+    # then examine how target-probe similarity varies as the third item moves
+    # around. In particular, see whether similarity increases as item three
+    # approaches its correct hue, or decreases as a result of getting too close
+    # to other items, and thus violating the higher level structure (i.e. that
+    # the three hues were all dissimilar). Next, test the case in which the
+    # target hues are all close. As before, let just one item vary in the
+    # response options. Does the similarity score go up as one item gets closer
+    # to its correct value, or is it penalized for violating the higher level
+    # structure (all items being similar).
+    # fig, ax = plt.subplots(
+    #     ncols=len(model_classes),
+    #     figsize=(2.5 * len(model_classes), 3)
+    # )
+    # if not hasattr(ax, '__len__'):
+    #     ax = [ax]
+    # for i, mclass in enumerate(model_classes):
+    #     dfm = df[df.model_name.str.contains(mclass + '_l')]
+    #     best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
+    #     layer_idx = np.argmax(tcc.models.name == best_layer)
+    #     # Dissimilar hues
+    #     item_locs = (0. + 90., 120. + 90., 240. + 90.)
+    #     sims = []
+    #     for rot in np.arange(0, 360, 16):
+    #         # Repeat experiment for different rotations of the target hues,
+    #         # keeping the original spacing in hue angle space.
+    #         target_hues = np.array([0., 120., 240.]) + rot
+    #         choice_hues = [
+    #             np.array([60., 180., j]) + rot for j in range(1, 360)
+    #         ]
+    #         if mclass.startswith('clip_RN50'):
+    #             embed_func = clip_embed
+    #             img_size = 224
+    #             embed_args = (tcc.models.specs.values[layer_idx], 'RN50')
+    #         elif mclass in ['vgg19', 'resnet50']:
+    #             embed_func = torchvision_embed
+    #             img_size = 224
+    #             embed_args = (tcc.models.specs.values[layer_idx], mclass)
+    #         else:
+    #             raise NotImplementedError()
+    #         target_id = (tuple(target_hues), item_locs)
+    #         choice_ids = [(tuple(ph), item_locs) for ph in choice_hues]
+    #         Z = tcc._embed(
+    #             mclass + f'_l{best_layer}',
+    #             target_id,
+    #             choice_ids,
+    #             embed_func,
+    #             img_size,
+    #             *embed_args
+    #         )
+    #         sims.append(cossim_torch(Z[0], Z[1:]).detach().cpu().numpy())
+    #     sims = np.mean(sims, axis=0)
+    #     # Summarize repulsion by taking differences between mirrored points on
+    #     # either side of the true hue value (at index 239). Differences of zero
+    #     # indicate no repulsion bias. (A repulsion bias would occur if there is
+    #     # a preference for maintaining the higher-level structure of spread
+    #     # out hues.) Positive values indicate repulsion.
+    #     repulsion_bias = sims[240:290] - sims[189:239]
+    #     # ax[i].plot(range(1, 360), sims)
+    #     ax[i].plot(list(range(-50, 0) + list(range(1, 51))), repulsion_bias)
+    #     tcc.embeddings_cache = {}  # Need to manually reset
+    #     # Similar hues
+    #     # TODO
+    # plt.show()
+    return
+
+
+def plot_scene_wheels_spearman_full(
+    data_pth, model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19']
+):
+    df = pd.read_csv(data_pth)
+    dfh = df[df.model_name == 'human']
+
+    # Spearman rank analysis
+    fig, ax = plt.subplots(
+        nrows=len(model_classes),
+        ncols=6,
+        figsize=(6 * 2.5, 4.5 * len(model_classes))
+    )
+    rad2idx = {'2': 0, '4': 1, '8': 2, '16': 3, '32': 4, 'all': 5}
+    for i, mclass in enumerate(model_classes):
+        dfm = df[df.model_name.str.contains(mclass + '_l')]
+        for rad, group in dfm.groupby('radius'):
+            colors = [
+                'gray' if pval > 0.05 else 'b' for pval in group.spearman_pval
+            ]
+            layer_idxs = np.array([
+                int(n.split('_')[-1][1:]) for n in group.model_name.values
+            ])
+            isort = np.argsort(layer_idxs)
+            ax[i][rad2idx[rad]].bar(
+                range(len(group)),
+                group.spearman_r.values[isort],
+                color=colors,
+            )
+            ax[i][rad2idx[rad]].set_xticks([])
+            ax[i][rad2idx[rad]].set_xticklabels([])
+            ax[i][rad2idx[rad]].set_xlabel(f'{mclass} layers')
+            ax[i][rad2idx[rad]].set_ylim(-0.3, 1)
+            if i == 0:
+                ax[i][rad2idx[rad]].set_title(f'Radius={rad}')
+    ax[0, 0].set_ylabel('Spearman rho')
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/scene_wheels/spearman_bars.pdf')
+
+
+def plot_scene_wheels_spearman_condensed(
+    data_pth, model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19']
+):
+    df = pd.read_csv(data_pth)
+    dfh = df[df.model_name == 'human']
+    radii = ['all', 2, 4, 8, 16, 32]
+    dfp = pd.DataFrame({
+        'axis': [],
+        'x': [],
+        'y': [],
+    })
+    min_y = np.inf
+    for i, mclass in enumerate(model_classes):
+        if mclass in ['rgb', 'pixels', 'vae_beta0.01']:
+            pths_r = [
+                data_pth.parent.glob(f'summary_data_{mclass}_rad_{r}.csv')
+                for r in radii
+            ]
+        else:
+            pths_r = [
+                data_pth.parent.glob(f'summary_data_{mclass}_l*_rad_{r}.csv')
+                for r in radii
+            ]
+        dfms = [
+            pd.concat([pd.read_csv(pth) for pth in pths]) for pths in pths_r
+        ]
+        best_layer, dp = dfms[0].groupby(
+            ['model_name', 'dprime']
+        )['loglik'].mean().idxmax()
+        # dfm = df[df.model_name.str.startswith(mclass + '_l')]
+        # dfm_ = dfm[dfm.radius == 'all']
+        # name = dfm_[dfm_.loglik == dfm_.loglik.max()].model_name.values[0]
+        # dfmn = dfm[dfm.model_name == name]
+        for j, r in enumerate(radii):
+            x = [i]
+            # y = dfmn[dfmn.radius == str(r)].spearman_r
+            dfm_best = dfms[j][dfms[j].model_name == best_layer]
+            y = dfm_best.spearman_r
+            dfp = pd.concat([
+                dfp,
+                pd.DataFrame({
+                    'axis': [j],
+                    'name': best_layer,
+                    'x': x,
+                    'y': y,
+                })
+            ])
+            if np.min(y) < min_y:
+                min_y = np.min(y)
+    cil = [dfh[dfh.radius == str(r)].conf_int95_lower.values[0] for r in radii]
+    ciu = [dfh[dfh.radius == str(r)].conf_int95_upper.values[0] for r in radii]
+
+    fig, ax = plt.subplots(
+        ncols=len(radii), figsize=(2 * len(radii), 5)
+    )
+    for i, r in enumerate(radii):
+        ax[i].set_ylim(min_y * 1.05, 0.93)
+        ax[i].set_title(f'Radius: {r}')
+        ax[i].set_xticks(range(len(model_classes)))
+        ax[i].set_xticklabels(model_classes, ha='right', rotation=45)
+        ax[i].spines[['right', 'top']].set_visible(False)
+        if i != 0:
+            ax[i].set_yticklabels([])
+    for i in range(len(ax)):
+        dfpi = dfp[dfp.axis == i]
+        ax[i].bar(dfpi.x, dfpi.y, width=0.25, label=dfpi.name)
+        ax[i].hlines(
+            cil[i], dfpi.x.min(), dfpi.x.max(), linestyle='dotted', colors='gray'
+        )
+        ax[i].hlines(
+            ciu[i], dfpi.x.min(), dfpi.x.max(), linestyle='dotted', colors='gray'
+        )
+    ax[0].set_ylabel('Spearman rho')
+    # ax[0].set_xlabel('Architecture')
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/scene_wheels/spearman_bars_condensed.pdf')
+
+
+def plot_scene_wheels_error_vs_radius(
+    data_pth, model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19']
+):
+    # TODO: Save out separate csv for human summary, rather than relying on the
+    # compiled summary we are loading here, which is a holdover from when I
+    # wasn't saving a separate summary file for each model.
+    df = pd.read_csv(data_pth)
+    dfh = df[df.model_name == 'human']
+    fig, ax = plt.subplots(
+        ncols=len(model_classes), figsize=(2 * len(model_classes), 2.2)
+    )
+    radii = [2, 4, 8, 16, 32]
+    herrs = [dfh[dfh.radius == str(r)].mean_abs_err.values[0] for r in radii]
+    for i, mclass in enumerate(model_classes):
+        if mclass in ['rgb', 'pixels', 'vae_beta0.01']:
+            pths_r = [
+                data_pth.parent.glob(f'summary_data_{mclass}_rad_{r}.csv')
+                for r in radii + ['all']
+            ]
+        else:
+            pths_r = [
+                data_pth.parent.glob(f'summary_data_{mclass}_l*_rad_{r}.csv')
+                for r in radii + ['all']
+            ]
+        dfms = [
+            pd.concat([pd.read_csv(pth) for pth in pths]) for pths in pths_r
+        ]
+        ax[i].plot(radii, herrs, label='human')
+        # Plot only best-fit layer per model class
+        best_layer, dp = dfms[-1].groupby(
+            ['model_name', 'dprime']
+        )['loglik'].mean().idxmax()
+        y = [
+            dfm[dfm.model_name == best_layer].mean_abs_err.values[0]
+            for dfm in dfms[:-1]
+        ]
+        # ax[i].plot(radii, y, label=f"{best_layer} (d'={dp:.1f})")
+        ax[i].plot(radii, y, label=f"{mclass}")
+        ax[i].set_xticks(radii)
+        ax[i].set_xticklabels(radii)
+        ax[i].legend()
+    ax[0].set_xlabel('Radius')
+    ax[0].set_ylabel('Mean abs error')
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/scene_wheels/error_per_radius.pdf')
+
+
+def plot_scene_wheels_scatters(
+    data_pth,
+    model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19'],
+    radius='all',
+):
+    fig, ax = plt.subplots(
+        ncols=len(model_classes), figsize=(5 * len(model_classes), 5)
+    )
+    tcc = TCCSceneWheel()
+    herrs = tcc.get_human_errors_by_key()
+    for i, mclass in enumerate(model_classes):
+        if mclass in ['rgb', 'pixels', 'vae_beta0.01']:
+            pths = data_pth.glob(f'summary_data_{mclass}_rad_all.csv')
+        else:
+            pths = data_pth.glob(f'summary_data_{mclass}_l*_rad_all.csv')
+        dfm = pd.concat([pd.read_csv(pth) for pth in pths])
+        # Get best-fit model according to summary data file
+        best_layer, best_dp = dfm.groupby(
+            ['model_name', 'dprime']
+        )['loglik'].mean().idxmax()
+        layer_idx = np.argmax(tcc.models.name == best_layer)
+        errs = tcc.get_or_load_TCC_samples(layer_idx, best_dp)[1]
+        x = []
+        y = []
+        for key in herrs.keys():
+            if radius == 'all' or key[1] == radius:
+                x.append(np.abs(herrs[key]).mean())
+                y.append(np.abs(errs[key]).mean())
+        ax[i].scatter(x, y, label=mclass, s=1)
+        ax[i].legend()
+    ax[0].set_xlabel('Human mean abs error')
+    ax[0].set_ylabel('Model mean abs error')
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/scene_wheels/error_scatters_rad_{radius}.pdf')
+
+
+def plot_scene_wheels(
+    data_pth,
+    model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19'],
+    analyses=[
+        'spearman_full', 'spearman_condensed', 'error_vs_radius', 'scatters',
+    ]
+):
+    if 'scatters' in analyses:
+        for rad in [2, 4, 8, 16, 32, 'all']:
+            plot_scene_wheels_scatters(
+                data_pth.parent, model_classes=model_classes, radius=rad,
+            )
+
+    if 'spearman_full' in analyses:
+        plot_scene_wheels_spearman_full(
+            data_pth, model_classes=model_classes
+        )
+
+    if 'spearman_condensed' in analyses:
+        # Condensed version of previous plot showing only best-fit layers
+        plot_scene_wheels_spearman_condensed(
+            data_pth, model_classes=model_classes
+        )
+
+    if 'error_vs_radius' in analyses:
+        # Mean abs error per radius (humans vs. models)
+        plot_scene_wheels_error_vs_radius(
+            data_pth, model_classes=model_classes
+        )
+
+
+def make_tables(
+    sw_data_pth,
+    tb_data_pth,
+    brady_data_pth,
+):
+    def _make(df):
+        df['pval_bins'] = pd.cut(df.spearman_pval, [0, 0.001, 0.01, 0.1, 0.5, 1.0])
+        df['pval_thresh'] = df.pval_bins.apply(lambda x: x.right)
+        df['Model'] = df.model_name.str.rsplit('_', n=1, expand=True)[0]
+        df.Model = df.Model.str.replace('rgb', 'RGB channel means')
+        df.Model = df.Model.str.replace('pixels', 'Pixels')
+        df.Model = df.Model.str.replace('vae', 'VAE')
+        df.Model = df.Model.str.replace('vgg19', 'VGG-19')
+        df.Model = df.Model.str.replace('clip_RN50', 'CLIP-RN50')
+        df.Model = df.Model.str.replace('clip_ViT-B16', 'CLIP-ViT-B16')
+        df['Spearman'] = df.spearman_r.round(2).astype(str) + f' ($p < ' + df.pval_thresh.astype(str) + ' $)'
+        df['Log-likelihood'] = df.loglik.round().astype(int)
+        print(df.loc[:, ['Model', 'Spearman', 'Log-likelihood']].to_latex(escape=False, index=False))
+
+    print('SCENE WHEEL RESULTS')
+    layers_sw, dprimes_sw, df_sw = get_best_fit_models(
+        sw_data_pth,
+        model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+        binsize=12,
+        return_df=True,
+        verbose=True,
+    )
+    df = pd.concat([
+        df_sw.loc[(df_sw.model_name == layer) & (df_sw.dprime == dp) & (df_sw.radius == 'all')]
+        for layer, dp in zip(layers_sw, dprimes_sw)
+    ])
+    _make(df)
+
+    print('TAYLOR BAYS RESULTS')
+    layers_tb, dprimes_tb, df_tb = get_best_fit_models(
+        tb_data_pth,
+        model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+        binsize=12,
+        return_df=True,
+        verbose=True,
+    )
+    df = pd.concat([
+        df_tb.loc[(df_tb.model_name == layer) & (df_tb.dprime == dp)]
+        for layer, dp in zip(layers_tb, dprimes_tb)
+    ])
+    _make(df)
+
+    print('BRADY ALVAREZ RESULTS')
+    layers_brady, dprimes_brady, df_brady = get_best_fit_models(
+        brady_data_pth,
+        model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+        binsize=12,
+        return_df=True,
+        verbose=True,
+    )
+    df = pd.concat([
+        df_brady.loc[(df_brady.model_name == layer) & (df_brady.dprime == dp)]
+        for layer, dp in zip(layers_brady, dprimes_brady)
+    ])
+    _make(df)
+
+
+def make_regression_features_table():
+    table = pd.DataFrame({
+        'Feature name': [
+            r'radius',
+            r'disk\_size',
+            r'vae\_beta0.01',
+            r'countr\_estimate',
+            r'keypoints\_2d',
+            r'keypoints\_3d',
+            r'seg\_2d',
+            r'seg\_25d',
+            r'vgg19\_l*\_mean\_abs',
+            r'vgg19\_l*\_spatial\_entropy',
+        ],
+        'Description': [
+            'Radius in GAN space. Not a feature of stimulus but of response set. Larger radius means response alternatives are more distinct from stimulus and each other, and therefore result in less difficult trials. Included in regression to allow predictions to account for this stimulus-independent source of variability in human error.',
+            'Disk storage size for stimulus images (here we used JPEG).',
+            r'$\mathrm{mean}(\mathrm{abs}(z))$, where $z$ are the activation values corresponding to $\mu$ in $\beta$-VAE encoder output layer. This model was the same as the one used to create a baseline TCC model (see Main). Its $\beta$ value was $0.01$ and it was trained on the Places-365 dataset. Due to regularization toward the zero-mean prior, large activations magnitudes should generally be rare, but more complex images may elicit higher magnitudes.',
+            'Output of CounTR model, which estimates number of objects in an image.',
+            r'$\mathrm{mean}(\mathrm{abs}(y))$, where $y$ is the output activation map from the 2D keypoints model in the Midlevel-vision repository. Higher values indicate higher confidence in the presence of a 2D keypoint. Images with more points of interest may be more difficult to remember. (Based on SURF features.)',
+            r'Same as keypoints\_2d except with 3D keypoints. (Based on NARF features.)',
+            'Disk size of image output from Midlevel-vision unsupervised segmentation (2D) model, which is based on gestalt principles. Images with greater gestalt complexity may be more difficult to remember. (Note that PCA is applied to raw outputs to reduce to 3 image channels, following method by authors).',
+            r'Same as seg\_2d, except with 2.5D gestalt features.',
+            r'$\mathrm{mean}(\mathrm{abs}(y))$, where $y$ are hidden activations from VGG19 trained on ImageNet-1k at layer k. Due to regularization, activations are sparse. Images with higher visual load may elicit larger activations.',
+            r'$H(y)$, where $y$ are hidden activations from VGG19 trained on ImageNet-1k at layer k, and H is the "spatial" entropy. This measure increases to the extent that points of interest (as indicated by non-zero activations) are more evenly distributed across the image. This may be a relevant factor if people prefer focal attention over diffuse.',
+        ],
+    })
+    with pd.option_context("max_colwidth", 1000):
+        # table.style.to_latex(
+        #     buf='figures/summary/scene_wheels/regression_features.txt',
+        #     escape=False,
+        #     index=False,
+        #     caption='Description of features used in trial-difficulty regression analysis',
+        #     column_format='p{2cm}|p{5cm}',
+        #     label='regression_features'
+        # )
+        print(
+            table.style.format_index(escape="latex").hide(axis='index').to_latex(
+                caption='Description of features used in trial-difficulty regression analysis',
+                # column_format='p{2cm}|p{5cm}',
+                label='regression_features'
+            )
+        )
+
+
+def dprime_comparison(datasets, data_pths, model_classes=['vgg19', 'clip_RN50']):
+    dfs = []
+    for ds, pth in zip(datasets, data_pths):
+        dfi = pd.read_csv(pth)
+        dfi = dfi.rename(
+            columns={
+                'spearman_r_binsize12': 'spearman_r',
+                'spearman_pval_binsize12': 'spearman_pval',
+            }
+        )
+        dfi = dfi[dfi.model_name != 'human']
+        dfi['dataset'] = ds
+        dfs.append(dfi.copy())
+    # df = pd.concat(dfs)
+    # df = df.loc[df.groupby(['dataset', 'model_name'])['loglik'].idxmax()]
+
+    fig, ax = plt.subplots(
+        nrows=len(model_classes),
+        figsize=(len(datasets) * 2.5, 2.5 * len(model_classes))
+    )
+    if not hasattr(ax, '__len__'):
+        ax = [ax]
+    for i, ds in enumerate(datasets):
+        df = dfs[i]
+        if 'radius' in df.columns:
+            df = df[df.radius == 'all']
+        df = df.loc[df.groupby(['model_name'])['loglik'].idxmax()]
+        for idx, mclass in enumerate(model_classes):
+            dfm = df[df.model_name.str.startswith(mclass + '_l')]
+            y = dfm.dprime
+            x = np.arange(0, len(y))
+            ax[idx].bar(x + i * 0.25, y, width=0.2, label=ds)
+            ax[idx].set_title(f'{mclass}')
+            print(f'{ds}: {mclass}: {y.values}')
+    ax[-1].set_xlabel('Layer')
+    ax[-1].set_ylabel("d'")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f'figures/summary/dprime_comparison.pdf')
+    return
+
+
+if __name__ == '__main__':
+    import sys
+
+    tb_dataset = 'bays2014'
+    tb_data_pth = Path(
+        f'data_tcc/setsize_analysis/{tb_dataset}/summary.csv'
+        # f'data_tcc/setsize_analysis/{tb_dataset}/'
+    )
+    brady_data_pth = Path(
+        f'{DATA_STORAGE}/data_tcc/setsize_analysis/brady_alvarez/summary.csv'
+        # f'{DATA_STORAGE}/data_tcc/setsize_analysis/brady_alvarez/'
+    )
+    sw_data_pth = Path(
+        f'{DATA_STORAGE}/data_tcc/scene_wheels_analysis/summary_data.csv'
+        # f'{DATA_STORAGE}/data_tcc/scene_wheels_analysis/'
+    )
+
+    # PRINT RESULTS TABLES FOR MODEL FITS (ALL EXPERIMENTS)
+    make_tables(
+        sw_data_pth,
+        tb_data_pth,
+        brady_data_pth,
+    )
+
+    # PRINT INFO ABOUT BEST-FIT MODELS
+    # for pth in [sw_data_pth, tb_data_pth, brady_data_pth]:
+    #     print(pth)
+    #     get_best_fit_models(
+    #         pth,
+    #         model_classes=['vgg19', 'clip_RN50', 'clip_ViT-B16'],
+    #         binsize=12,
+    #         verbose=True,
+    #         return_df=False,
+    #     )
+
+    # SCENE WHEELS: DNN MODELS
+    plot_scene_wheels(
+        sw_data_pth,
+        model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19', 'rgb', 'pixels', 'vae_beta0.01'],
+        analyses=[
+            # 'spearman_full',
+            'spearman_condensed',
+            'error_vs_radius',
+        ],
+    )
+    # plot_scene_wheels(
+    #     sw_data_pth,
+    #     model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19', 'rgb', 'pixels', 'vae_beta0.01'],
+    #     analyses=['error_vs_radius'],
+    # )
+    # SCENE WHEELS: TRIAL DIFFICULTY REGRESSION ANALYSIS
+    # if len(sys.argv) > 1:
+    #     reg_type = sys.argv[1]
+    # else:
+    #     reg_type = 'linear'
+    # print(f'REGRESSION TYPE: {reg_type}')
+    # stimulus_difficulty_analysis(
+    #     ext='jpg', reg_type=reg_type, shuffle_baseline=False
+    # )
+    # Print feature descriptions as latex table
+    # make_regression_features_table()
+
+    # ORIENTATION WM
+    # plot_taylor_bays(
+    #     tb_data_pth,
+    #     dataset=tb_dataset,
+    #     model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19'],
+    #     analyses=[
+    #         # 'biases',
+    #         # 'spearman_full',
+    #         # 'spearman_condensed',
+    #         # 'quantiles',
+    #         # 'setsize',
+    #         # 'similarity_curves',
+    #         'setsize_and_similarity_curves',
+    #     ],
+    # )
+
+    # COLOR WM
+    # plot_brady(
+    #     brady_data_pth,
+    #     model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19'],
+    #     # model_classes=['finetuned_clip_RN50', 'finetuned_clip_ViT-B16'],
+    #     analyses=[
+    #         'similarity_curves',
+    #         # 'biases',
+    #         # 'spearman_full',
+    #         # 'spearman_condensed',
+    #         # 'quantiles',
+    #         # 'hierarchical',
+    #     ],
+    # )
+
+    # COMBINED COLOR AND ORIENTATION BIAS PLOT
+    # plot_bias_color_orientation(
+    #     tb_data_pth,
+    #     brady_data_pth,
+    #     binsize=12,
+    #     model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19'],
+    # )
+
+    # COMBINED COLOR AND ORIENTATION BAR PLOT
+    # plot_ss_spearman_condensed(
+    #     tb_data_pth,
+    #     brady_data_pth,
+    #     binsize=12,
+    #     model_classes=['clip_RN50', 'clip_ViT-B16', 'vgg19'],
+    # )
