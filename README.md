@@ -24,10 +24,12 @@ visualpriors (https://pypi.org/project/visualpriors/)
 scikit-image  
 scikit-learn  
 tqdm  
+p_tqdm  
 pymatreader (https://pypi.org/project/pymatreader/)  
 adjusttext (for one particular plotting analysis; https://pypi.org/project/adjustText/)  
 pandas  
 matplotlib  
+webdataset (https://pypi.org/project/webdataset/0.1.25/)
  
 For one analysis, I used CounTR (https://github.com/Verg-Avesta/CounTR). I copied their repo locally and created an environment variable to specify its filepath (see tcc_plotting.py).
  
@@ -38,17 +40,19 @@ USAGE:
  
 To fit TCC models for different DNN architectures on human responses in Scene Wheels dataset and save results to file: 
  
-python TCC_modeling.py --model-classes vgg19 clip_RN50 clip_ViT-B16 --scene-wheels-summary  
+`python TCC_modeling.py --model-classes rgb pixels vgg19 clip_RN50 clip_ViT-B16 --scene-wheels-summary`  
 
 Code can be tested on the 'rgb' baseline model, which is less resource-intensive:
 
-python TCC_modeling.py --model-classes rgb --scene-wheels-summary  
+`python TCC_modeling.py --model-classes rgb --scene-wheels-summary`  
  
 To produce the DNN comparison scatter plot:  
  
-python TCC_modeling.py --model-classes vgg19 clip_RN50 clip_ViT-B16 --arch-comparison  
+`python TCC_modeling.py --arch-comparison`  
+
+(The set of models to be compared is hard-coded in the dnn_arch_comparison function. These need to be run beforehand using the commands above using the --scene-wheels-summary flag.)
  
-To do the same but on VWM datasets: 
+To fit models on VWM datasets, do: 
   
 `python TCC_modeling.py --model-classes vgg19 clip_RN50 clip_ViT-B16 --taylor-bays`  
 `python TCC_modeling.py --model-classes vgg19 clip_RN50 clip_ViT-B16 --brady-alvarez`  

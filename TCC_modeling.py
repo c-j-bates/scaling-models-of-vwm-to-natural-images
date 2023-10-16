@@ -1,7 +1,7 @@
 from argparse import Namespace
 from itertools import product
 import json
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 import multiprocessing
 from networks import VAEMLP
 import numpy as np
@@ -809,7 +809,6 @@ def convnext_embed(X, layer_idx, arch):
 def harmonized_embed(X, layer_idx, arch):
     Z = torch.stack(X).float().to(device)
     Z = get_harmonization_features(Z, arch=arch, layer_idx=layer_idx)
-    # Z = Z.detach().cpu().numpy()
     Z = Z.reshape(len(Z), -1)
     return Z
 
@@ -1003,7 +1002,7 @@ def load_brady_alvarez():
                     'target3': [(x['correctAnswer'][i, j, 2] + 360) % 360],
                     'probe_loc': [k],
                     'response': [(x['subjectReport'][i, j, k] + 360) % 360],
-                    'error': [x['subjectError'][i, j, k]],
+                    'error': [-x['subjectError'][i, j, k]],  # Sign convention for errors was flipped in dataset!
                     'K': [3],  # Setsize (for consistency with other datasets)
                 }, index=[idx])
             )
@@ -1093,33 +1092,6 @@ class TCCModel():
         else:
             att_str = ''
 
-        # Implement mixture model that averages similarities over window of N
-        # consecutive layers within a deep neural network
-        window_dict = {
-            # 'clip_RN101': 4,  # THIS DIDN'T SEEM TO WORK VERY WELL...
-        }
-        # max_depth_dict = {
-        #     'vgg19': 36,
-        #     'resnet50': 20,  # TODO: Double-check this
-        #     'places_resnet50': 20,  # TODO: Update places_CNN extractor to new sub-module system
-        #     'clip_ViT-B16': None,  # TODO
-        #     'clip_ViT-B32': None,  # TODO
-        #     'clip_RN50': 26,
-        #     'clip_RN50x4': 36,
-        #     'clip_RN50x16': 50,
-        #     'clip_RN50x64': 74,
-        #     'clip_RN101': 43,
-        #     'ViT-B16': None,  # TODO
-        #     'ViT-B32': None,  # TODO
-        #     'convnext_base': 36,
-        #     'convnext_base_1k': 36,
-        #     'convnext_large': 36,
-        #     'convnext_large_1k': 36,
-        #     'harmonized_RN50': 49,
-        #     'harmonized_ViT_B16': 49,  # TODO
-        #     'omnidata_depth': None,  # TODO
-        # }
-
         # Data collection
         self.dataset = dataset
         if dprime_data_pth is None:
@@ -1145,14 +1117,9 @@ class TCCModel():
 
         # VAE with 256x256 input
         vae_betas = [0.01]
-        # vae_betas = [0.01, 0.1, 0.5]
         vae_losses = [None] * 3  # None for px-mse, int for dnn-embed layer
         vae_ckpts = [12, 12, 12]
         vae_specs = list(zip(vae_betas, vae_losses, vae_ckpts))
-        # OLD IDEA
-        # vgg_mixtures = [
-        #     (i, j) for i, j in product(vgg_layers, repeat=2) if i != j
-        # ]
 
         model_layers = eval(model_layers)  # Possibly overwrite layer selection for subset of models
         layers_dict = {
@@ -1231,50 +1198,12 @@ class TCCModel():
             str(x) for x in vae_specs
         ]
 
-        # # Model: VGG-19 mixture model (linear combinations of pairs of layers)
-        # models.loc[models.model_class == 'vgg_multi', 'name'] = [
-        #     f'vgg19_l{"_".join([str(l) for l in layers])}{att_str}'
-        #     for layers in vgg_mixtures
-        # ]
-        # models.loc[models.model_class == 'vgg_multi', 'image_size'] = imgsize_dcnn
-        # models.loc[models.model_class == 'vgg_multi', 'specs'] = [
-        #     str(x) for x in vgg_mixtures
-        # ]
-
         for name in layers_dict.keys():
             models.loc[models.model_class == name, 'name'] = [
                 f'{name}_l{layer}{att_str}' for layer in layers_dict[name]
             ]
             models.loc[models.model_class == name, 'image_size'] = imgsize_dict[name]
             models.loc[models.model_class == name, 'specs'] = layers_dict[name]
-
-        # 'Windows' analysis
-        # for name, win_size in window_dict.items():
-        #     # models.loc[models.model_class == name, 'name'] = [
-        #     #     f'{name}_l{layer}+{win_size}{att_str}'
-        #     #     for layer in layers_dict[name]
-        #     #     if layer + win_size - 1 <= max_depth_dict[name]
-        #     # ]
-        #     # models.loc[models.model_class == name, 'image_size'] = imgsize_dict[name]
-        #     # models.loc[models.model_class == name, 'specs'] = list(range())
-        #     win_names = [
-        #         f'{name}_l{layer}+{win_size}{att_str}'
-        #         for layer in layers_dict[name]
-        #         if layer + win_size - 1 <= max_depth_dict[name]
-        #     ]
-        #     specs = [
-        #         list(range(layer, layer + win_size))
-        #         for layer in layers_dict[name]
-        #         if layer + win_size - 1 <= max_depth_dict[name]
-        #     ]
-        #     df_ = pd.DataFrame({
-        #         'model_class': [name] * len(win_names),
-        #         'name': win_names,
-        #         'path': [np.nan] * len(win_names),
-        #         'specs': specs,
-        #         'image_size': [imgsize_dict[name]] * len(win_names),
-        #     })
-        #     models = pd.concat([models, df_])
 
         # File path names
         models.path = [
@@ -1306,7 +1235,9 @@ class TCCModel():
         self.dprimes = {}
         for mclass in models.model_class:
             if type(dprimes) is dict:
-                self.dprimes[mclass] = dprimes.get(mclass, dprimes)
+                self.dprimes[mclass] = dprimes.get(
+                    mclass, np.linspace(self.dp_min, self.dp_max, self.ngrid)
+                )
             else:
                 self.dprimes[mclass] = dprimes
 
@@ -1320,6 +1251,7 @@ class TCCModel():
         """
         if not hasattr(self, 'embeddings_cache'):
             self.embeddings_cache = {}
+        # NOTE: NO LONGER EXPERIMENTING WITH ATTENTION STUFF
         # If using attention, get dimensionality reduction transform first, to
         # transform the embeddings
         att_model = None
@@ -1531,30 +1463,6 @@ class TCCModel():
                     key: np.mean([x[key] for x in sims], axis=0)
                     for key in sims[0].keys()
                 }
-            # Old thing I tried, where I averaged pairs of layers' similarities
-            # if mclass == 'vgg_multi':
-            #     # Check if similarities have already been computed for each
-            #     # mixture component
-            #     layers = eval(self.models.specs.values[i])
-            #     sims_comp = []
-            #     for lay in layers:
-            #         mod = self.models[
-            #             (self.models.model_class == 'vgg') &
-            #             (self.models.specs == lay)
-            #         ]
-            #         pth1 = mod.path.values[0]
-            #         if pth1.exists():
-            #             sims_comp.append(
-            #                 np.load(pth1, allow_pickle=True).item()
-            #             )
-            #         else:
-            #             sims_comp.append(
-            #                 self._get_model_similarities(int(mod.index[0]))
-            #             )
-            #     self.sims[mname] = {
-            #         key: np.mean([x[key] for x in sims_comp], axis=0)
-            #         for key in sims_comp[0].keys()
-            #     }
             elif pth.exists():
                 self.sims[mname] = np.load(
                     pth, allow_pickle=True
@@ -1636,7 +1544,7 @@ class TCCModel():
                 })
                 df1.to_csv(pth)
             else:
-                df1 = pd.read_csv(pth)
+                df1 = pd.read_csv(pth, index_col=0)
                 if not np.allclose(df1.dprime.values, np.array(self.dprimes[mclass])):
                     raise Exception(
                         f'd-prime values loaded from {pth} do not match.'
@@ -1911,11 +1819,12 @@ class TCCSceneWheel(TCCModel):
 
         def _get_error_dataframe(idx):
             name = self.models.name.values[idx]
+            mclass = self.models.model_class.values[idx]
             df_pth = Path(
                 str(out_pth.with_suffix('')) + f'_{name}_rad_{rad}.csv'
             )
             if df_pth.exists():
-                df_idx = pd.read_csv(df_pth)
+                df_idx = pd.read_csv(df_pth, index_col=0)
             else:
                 self._load_or_get_sims([idx])
                 self._load_or_fit_dprimes([idx])
@@ -1929,6 +1838,7 @@ class TCCSceneWheel(TCCModel):
                 )
                 rho, pval = spearmanr(merrs_bin_ave_flat, herrs_bin_ave_flat)
                 df_idx = pd.DataFrame({
+                    'model_class': [mclass],
                     'model_name': [name],
                     'dprime': [dp_best],
                     'loglik': [df_.loglik.max()],  # LL for for all trials, therefore duplicated across radii
@@ -1942,20 +1852,13 @@ class TCCSceneWheel(TCCModel):
                 df_idx.to_csv(df_pth)
             return df_idx
 
-        if self.attention_method == 'pca':
-            att_str = f'_pca{self.pca_explained_var}'
-        elif self.attention_method == 'nmf':
-            att_str = f'_nmf{self.nmf_comp}'
-        elif self.attention_method == 'vae':
-            att_str = f'_vae{self.att_vae_beta}'
-        else:
-            att_str = ''
         out_pth = Path(
-            f'{MODEL_OUT_PATH}/scene_wheels_analysis/summary_data{att_str}.csv'
+            f'{MODEL_OUT_PATH}/scene_wheels_analysis/summary.csv'
         )
         out_pth.parent.mkdir(parents=True, exist_ok=True)
 
         data = pd.DataFrame({
+            'model_class': [],
             'model_name': [],
             'dprime': [],
             'radius': [],
@@ -1980,46 +1883,6 @@ class TCCSceneWheel(TCCModel):
             herrs_bin_ave_flat = self._get_values_list_flat(
                 stimulus_keys, human_errs_by_stim, rad_set, bins
             )
-
-            # EXPERIMENTING WITH NOISE CEILING
-            # df = self.human_data
-            # # Split data in half, grouping by response wheel to keep it balanced
-            # df0 = df.groupby([
-            #     'wheel_num', 'radius', pd.cut(df.answer, np.arange(-1, 360, 30))
-            # ]).sample(frac=0.5)
-            # df1 = df.drop(df0.index)  # Other half
-            # hbk0 = self.get_human_errors_by_key(idxs=df0.index)
-            # hbk1 = self.get_human_errors_by_key(idxs=df1.index)
-            # herrs0 = tcc._get_values_list_flat(
-            #     stimulus_keys,
-            #     hbk0,
-            #     rad_set,
-            #     bins
-            # )
-            # herrs1 = tcc._get_values_list_flat(
-            #     stimulus_keys,
-            #     hbk1,
-            #     rad_set,
-            #     bins
-            # )
-            # # plt.scatter(herrs0, herrs1);
-            # # plt.show()
-            # print(spearmanr(herrs0, herrs1), pearsonr(herrs0, herrs1))
-            # from ipdb import set_trace; set_trace()
-
-            data = pd.concat([
-                data,
-                pd.DataFrame({
-                    'model_name': ['human'],
-                    'dprime': [np.nan],
-                    'radius': [rad],
-                    'mean_abs_err': [np.mean(herrs_bin_ave_flat)],
-                    'spearman_r': [np.nan],
-                    'spearman_pval': [np.nan],
-                    'conf_int95_lower': [np.nan],
-                    'conf_int95_upper': [np.nan],
-                })
-            ])
             # THIS ISN'T WORKING. COMPUTED VALUES ARE GETTING OVERWRITTEN
             # FOR SOME REASON. MAYBE A NAMESPACE ISSUE.
             # dfs_idx = p_map(
@@ -2049,7 +1912,6 @@ class TCCSceneWheel(TCCModel):
                     boot_idxs = self.human_data.groupby([
                         'wheel_num', 'radius', pd.cut(self.human_data.answer, np.arange(-1, 360, 30))
                     ]).sample(frac=1, replace=True).index
-                    # boot_idxs = self.human_data.groupby('radius').sample(frac=1, replace=True).index
                     herrs_by_stim_k = self.get_human_errors_by_key(boot_idxs)
                     herrs_bin_ave_flat_k = self._get_values_list_flat(
                         stimulus_keys, herrs_by_stim_k, rad_set, bins
@@ -2062,232 +1924,24 @@ class TCCSceneWheel(TCCModel):
                 conf_upper = rhos[int(round(num_boot * 0.95))]
                 conf_int_pth.parent.mkdir(parents=True, exist_ok=True)
                 np.save(conf_int_pth, np.array([conf_lower, conf_upper]))
-            idxs = np.logical_and(
-                data.model_name == 'human', data.radius == rad
+            human_df = pd.DataFrame({
+                'model_class': ['human'],
+                'model_name': ['human'],
+                'dprime': [np.nan],
+                'radius': [rad],
+                'mean_abs_err': [np.mean(herrs_bin_ave_flat)],
+                'spearman_r': [np.nan],
+                'spearman_pval': [np.nan],
+                'conf_int95_lower': [conf_lower],
+                'conf_int95_upper': [conf_upper],
+            })
+            human_df_pth = Path(
+                str(out_pth.with_suffix('')) + f'_human_rad_{rad}.csv'
             )
-            data.loc[idxs, 'conf_int95_lower'] = conf_lower
-            data.loc[idxs, 'conf_int95_upper'] = conf_upper
-
+            human_df.to_csv(human_df_pth)
+            data = pd.concat([data, human_df])
         data.to_csv(out_pth)
         return data
-
-    def perceptual_similarity_analysis(
-        self, df, model_classes, radius='all', binsize=30, num_to_take=48,
-    ):
-        """
-        Do perceptual judgments predict memory errors?
-        Are mismatches between human and models explained by mismatches
-        between perceptual judgments and models?
-        For each model, select trials where it disagrees most with humans and
-        save corresponding images to file for visualization purposes.
-        """
-        self._load_or_get_sims()
-        if radius == 'all':
-            rad_set = [2, 4, 8, 16, 32]
-        else:
-            rad_set = [radius]
-        bins = np.arange(0, 360 + 1, binsize)  # Stimulus bins
-        stimulus_keys = set()
-        for i in range(len(self.human_data)):
-            stimulus_keys |= set([self._get_key_from_idx(i)])
-        stimulus_keys = list(stimulus_keys)
-        human_errs_by_stim = self.get_human_errors_by_key()
-        herrs_bin_ave_flat = self._get_values_list_flat(
-            stimulus_keys, human_errs_by_stim, rad_set, bins
-        )
-        # Perceptual likert judgments
-        df_perc = pd.read_csv(
-            Path('scene_wheels_mack_lab_osf').joinpath(
-                'Data',
-                'sceneWheel_perceptValidation_data_n128.csv'
-            )
-        )
-        # Note: Binned by 30deg increments for perceptual judgments experiment
-        # and these correspond to the left bin edges that I used for averaging
-        # memory errors
-        target_set = df_perc.pair1.unique()
-        mean_sims_flat = []
-        for wid in range(1, 6):
-            for r in rad_set:
-                for target in target_set:
-                    # Calculate average similarity to alternatives for each target
-                    mean_sims_flat.append(
-                        df_perc[
-                            (df_perc.radius == r) & (df_perc.wheel == wid)
-                        ].responses.mean()
-                    )
-        print(
-            'Human memory vs. similarity judgments: ',
-            spearmanr(mean_sims_flat, herrs_bin_ave_flat)
-        )
-        # Convert similarity judgments into predicted error scores by
-        # training regression model against human memory errors
-        X = np.array(mean_sims_flat).reshape(-1, 1)
-        y = np.array(herrs_bin_ave_flat)
-        # Convert to log-"odds" in order for target to be in (-inf, inf)
-        y = np.log(y / (180 - y))  # 180 deg is max error
-        model = LinearRegression()
-        model.fit(X, y)
-        mean_sims_reg = model.predict(X)
-        mean_sims_reg = 180 / (1 + np.exp(-mean_sims_reg))
-
-        for mclass in model_classes:
-            # Use model fit data to select best layers from each model
-            dfm = df[df.model_name.str.contains(mclass + '_l')]
-            best_layer, best_dp = dfm.groupby(
-                ['model_name', 'dprime']
-            )['loglik'].mean().idxmax()
-            layer_idx = np.argmax(self.models.name == best_layer)
-            model_errs_by_stim = self.get_or_load_TCC_samples(
-                layer_idx, best_dp
-            )[1]
-            merrs_bin_ave_flat = self._get_values_list_flat(  # Mean abs errors
-                stimulus_keys, model_errs_by_stim, rad_set, bins
-            )
-            diffs = np.array(merrs_bin_ave_flat) - np.array(herrs_bin_ave_flat)
-            assert len(self.wheel_id_vals) * len(rad_set) * (360 // binsize) == len(diffs)
-
-            # METHOD 1:
-            # Get difference between model mean errors and mean error predicted
-            # by similarity judgments (after fitting regression model)
-            # diffs1 = np.array(merrs_bin_ave_flat) - np.array(mean_sims_reg)
-
-            # METHOD 2:
-            # Fit linear model to predict similarity score from model error.
-            # Then take size of prediction error for each target bin, and
-            # correlate with (human error - model error)
-
-            # # Convert similarity judgments into predicted error scores by
-            # # training regression model against human memory errors
-            # Xi = np.array(merrs_bin_ave_flat).reshape(-1, 1)
-            # yi = np.array(mean_sims_flat)
-            # # Convert to log-"odds" in order for target to be in (-inf, inf)
-            # yi = np.log(yi / (180 - yi))  # 180 deg is max error
-            # model_i = LinearRegression()
-            # model_i.fit(Xi, yi)
-            # preds = model.predict(Xi)
-            # preds = 180 / (1 + np.exp(-preds))
-            # diffs1 = preds - np.array(mean_sims_flat)
-
-            # isort1 = np.argsort(diffs1)
-            # isort_abs1 = np.argsort(np.abs(diffs1))
-            # print(f'CLASS: {mclass}')
-            # print(
-            #     'Similarity-model discrepancies predicting human-model disrepancies: ',
-            #     spearmanr(np.abs(diffs), np.abs(diffs1)),
-            #     # spearmanr(isort, isort1),
-            #     # spearmanr(isort_abs, isort_abs1),
-            # )
-            # print(
-            #     'Model errors vs. mean similarity rating: ',
-            #     spearmanr(
-            #         np.array(merrs_bin_ave_flat), np.array(mean_sims_flat)
-            #     )
-            # )
-
-            # METHOD 3:
-            # Get mean similarity score for response options in each trial, for
-            # both model and human perceptual ratings, then do same regression
-            # as method 2.
-
-            Xi = self._get_values_list_flat(  # Get binned means
-                stimulus_keys,
-                self.sims[self.models.name[layer_idx]],
-                rad_set,
-                bins,
-                use_abs=False,
-            )
-            Xi = np.array(Xi).reshape(-1, 1)
-            yi = np.array(mean_sims_flat)
-            model_i = LinearRegression()
-            model_i.fit(Xi, yi)
-            preds = model.predict(Xi)
-            diffs1 = preds - np.array(mean_sims_flat)
-
-            isort1 = np.argsort(diffs1)
-            isort_abs1 = np.argsort(np.abs(diffs1))
-            print(f'CLASS: {mclass}')
-            print(
-                'Similarity-model discrepancies predicting human-model disrepancies: ',
-                spearmanr(np.abs(diffs), np.abs(diffs1)),
-                # spearmanr(isort, isort1),
-                # spearmanr(isort_abs, isort_abs1),
-            )
-            print(
-                'Model errors vs. mean similarity rating: ',
-                spearmanr(
-                    np.array(merrs_bin_ave_flat), np.array(mean_sims_flat)
-                )
-            )
-
-        from ipdb import set_trace; set_trace()
-        return
-
-    # def visualize_disagreements(
-    #     self, df, model_classes, radius='all', binsize=30, num_to_take=48,
-    # ):
-    #     """
-    #     For each model, select trials where it disagrees most with humans and
-    #     save corresponding images to file for visualization purposes.
-    #     """
-    #     self._load_or_get_sims()
-    #     if radius == 'all':
-    #         rad_set = [2, 4, 8, 16, 32]
-    #     else:
-    #         rad_set = [radius]
-    #     bins = np.arange(0, 360 + 1, binsize)  # Stimulus bins
-    #     stimulus_keys = set()
-    #     for i in range(len(self.human_data)):
-    #         stimulus_keys |= set([self._get_key_from_idx(i)])
-    #     stimulus_keys = list(stimulus_keys)
-    #     human_errs_by_stim = self.get_human_errors_by_key()
-    #     herrs_bin_ave_flat = self._get_values_list_flat(
-    #         stimulus_keys, human_errs_by_stim, [2, 4, 8, 16, 32], bins
-    #     )
-    #     for mclass in model_classes:
-    #         # Use model fit data to select best layers from each model
-    #         dfm = df[df.model_name.str.contains(mclass + '_l')]
-    #         best_layer, best_dp = dfm.groupby(['model_name', 'dprime'])['loglik'].mean().idxmax()
-    #         layer_idx = np.argmax(self.models.name == best_layer)
-    #         model_errs_by_stim = self.get_or_load_TCC_samples(
-    #             layer_idx, best_dp
-    #         )[1]
-    #         merrs_bin_ave_flat = self._get_values_list_flat(
-    #             stimulus_keys, model_errs_by_stim, rad_set, bins
-    #         )
-    #         diffs = np.array(merrs_bin_ave_flat) - np.array(herrs_bin_ave_flat)
-    #         assert len(self.wheel_id_vals) * len(rad_set) * (360 // binsize) == len(diffs)
-    #         isort = np.argsort(diffs)
-    #         isort_abs = np.argsort(np.abs(diffs))
-    #         idxs_human_worse = isort[:num_to_take]
-    #         idxs_model_worse = isort[-num_to_take:]
-    #         stim_ids = []
-    #         for wid in self.wheel_id_vals:
-    #             for r in rad_set:
-    #                 for target_bin in range(360 // binsize):
-    #                     stim_ids.append((wid, r, target_bin * binsize))
-    #         imgs = load_wheel_imgs(size=256)
-    #         grid_human_worse = torchvision.utils.make_grid([
-    #             imgs[sid[0]][sid[1]][sid[2]]
-    #             for i, sid in enumerate(stim_ids) if i in idxs_human_worse
-    #         ])
-    #         grid_model_worse = torchvision.utils.make_grid([
-    #             imgs[sid[0]][sid[1]][sid[2]]
-    #             for i, sid in enumerate(stim_ids) if i in idxs_model_worse
-    #         ])
-    #         grid_agree = torchvision.utils.make_grid([
-    #             imgs[sid[0]][sid[1]][sid[2]]
-    #             for i, sid in enumerate(stim_ids) if i in isort_abs[:48]
-    #         ])
-    #         pth0 = Path(f'{DATA_STORAGE}/figures/scene_wheels/{mclass}_human_worse.pdf')
-    #         pth1 = Path(f'{DATA_STORAGE}/figures/scene_wheels/{mclass}_model_worse.pdf')
-    #         pth2 = Path(f'{DATA_STORAGE}/figures/scene_wheels/{mclass}_close_agreement.pdf')
-    #         pth0.parent.mkdir(parents=True, exist_ok=True)
-    #         torchvision.utils.save_image(grid_human_worse, pth0)
-    #         torchvision.utils.save_image(grid_model_worse, pth1)
-    #         torchvision.utils.save_image(grid_agree, pth2)
-    #     from ipdb import set_trace; set_trace()
-    #     return
 
 
 class TCCSetsize(TCCModel):
@@ -2475,288 +2129,6 @@ class TCCSetsize(TCCModel):
             )[1]
         return self.errs
 
-    # def plot_error_hists(self):
-    #     # TODO: Update to new way of handling dprime fit data
-    #     Path(f'figures/{self.dataset}').mkdir(parents=True, exist_ok=True)
-    #     if not hasattr(self, 'errs'):
-    #         self.sample_model_errors()
-    #     if 'gabors' in self.item_type:
-    #         max_deg = 180
-    #     else:
-    #         max_deg = 360
-    #     fig, axs = plt.subplots(
-    #         nrows=len(self.errs), figsize=(6, 2 * len(self.errs))
-    #     )
-    #     if not hasattr(axs, '__len__'):
-    #         axs = [axs]
-    #     bins = np.linspace(0, max_deg / 2, max_deg // 2 + 1)
-    #     for ax, (name, errs) in zip(axs, self.errs.items()):
-    #         errs_arr = np.concatenate([np.abs(x) for x in errs.values()])
-    #         ax.hist(errs_arr, bins=bins[:-1])
-    #         ax.set_title(f'{name}')
-    #     plt.tight_layout()
-    #     fname = 'error_hist'
-    #     if self.fix_dprime:
-    #         fname += f'_dprime_{self.dprime_fixed_val}'
-    #     plt.savefig(f'figures/{self.dataset}/{fname}.pdf')
-
-    # def plot_error_bias(self):
-    #     # TODO: Update to new way of handling dprime fit data
-
-    #     Path(f'figures/{self.dataset}').mkdir(parents=True, exist_ok=True)
-    #     if not hasattr(self, 'errs'):
-    #         self.sample_model_errors()
-    #     fig, axs = plt.subplots(
-    #         nrows=len(self.errs), figsize=(6, 2 * len(self.errs))
-    #     )
-    #     if not hasattr(axs, '__len__'):
-    #         axs = [axs]
-    #     for ax, (name, errs_dict) in zip(axs, self.errs.items()):
-    #         # Set of target values may not be complete, so figure out which
-    #         # ones were actually generated. (Complete would mean -180 to 180
-    #         # by increments of one.)
-    #         targets = np.sort(np.unique([key[-1] for key in errs_dict.keys()]))
-    #         if 'colors' in self.item_type:
-    #             marker_colors = np.array([
-    #                 rgb_from_angle(t * np.pi / 180) for t in targets
-    #             ])
-    #         else:
-    #             marker_colors = None
-    #         errs_per_targ = {t: [] for t in targets}  # Bin by angle
-    #         for key, errs_stim_i in errs_dict.items():
-    #             target = key[-1]
-    #             errs_per_targ[target].append(errs_stim_i)
-    #         errs = [np.mean(errs_per_targ[t]) for t in targets]
-    #         ax.scatter(targets, errs, c=marker_colors)
-    #         ax.set_title(f'{name}')
-    #         # ax.set_ylim(-25, 25)
-    #     axs[-1].set_xlabel('Stimulus angle (deg)')
-    #     axs[-1].set_ylabel('Error (deg)')
-    #     plt.tight_layout()
-    #     fname = 'bias'
-    #     if self.fix_dprime:
-    #         fname += f'_dprime_{self.dprime_fixed_val}'
-    #     else:
-    #         # TODO: Do we need to consider this case?
-    #         raise NotImplementedError()
-    #     plt.savefig(f'figures/{self.dataset}/{fname}.pdf')
-
-    # def plot_report_freq(self):
-    #     # TODO: Update to new way of handling dprime fit data
-    #     Path(f'figures/{self.dataset}').mkdir(parents=True, exist_ok=True)
-    #     if not hasattr(self, 'errs'):
-    #         self.sample_model_errors()
-    #     if 'gabors' in self.item_type:
-    #         max_deg = 180
-    #     else:
-    #         max_deg = 360
-    #     fig, axs = plt.subplots(
-    #         nrows=len(self.errs), figsize=(6, 2 * len(self.errs))
-    #     )
-    #     if not hasattr(axs, '__len__'):
-    #         axs = [axs]
-    #     for ax, (name, errs_dict) in zip(axs, self.errs.items()):
-    #         targets = np.sort(np.unique([key[-1] for key in errs_dict.keys()]))
-    #         if 'colors' in self.item_type:
-    #             colors = np.array([
-    #                 rgb_from_angle(i * np.pi / 180) for i in range(max_deg)
-    #             ])
-    #         else:
-    #             colors = None
-    #         resps = np.array([
-    #             key[-1] + errs_stim_i for key, errs_stim_i in errs_dict.items()
-    #         ]).reshape(-1)
-    #         resps = resps % max_deg
-    #         hist = np.histogram(resps, bins=max_deg, density=True)
-    #         ax.bar(hist[1][:-1], hist[0], color=colors)
-    #         ax.set_title(f'{name}')
-    #     plt.tight_layout()
-    #     fname = 'response_hist'
-    #     if self.fix_dprime:
-    #         fname += f'_dprime_{self.dprime_fixed_val}'
-    #     else:
-    #         # TODO: Do we need to consider this case?
-    #         raise NotImplementedError()
-    #     plt.savefig(f'figures/{self.dataset}/{fname}.pdf')
-
-
-class TCCPanichello(TCCSetsize):
-    """
-    Analyze data from:
-    "Error-correcting dynamics in visual working memory" (Panichello et al.)
-    https://www.nature.com/articles/s41467-019-11298-3#data-availability
-    """
-    def __init__(self, setsize, RIs, *args, reps=1, **kwargs):
-        raise NotImplementedError()
-        dataset = f'panichello_setsize{setsize}'
-        super(TCCPanichello, self).__init__(
-            setsize,
-            *args,
-            dataset=dataset,
-            lab_center=[60., 22., 14.],
-            lab_radius=52.,
-            **kwargs
-        )
-        self.human_data = self._load_augmented_data(reps, setsize, RIs)
-        self.setsize = setsize
-
-    def _load_augmented_data(self, reps, setsize, RIs):
-        pth = Path(
-            f'panichello/exp1_human_setsize{setsize}_augmented_{reps}_samples.pkl'
-        )
-        if not pth.exists():
-            human_data = load_panichello()
-            human_data = human_data[human_data.K == setsize]
-            human_data = human_data[human_data.RI.isin(RIs)]
-            # Because original dataset does not include info about item locations,
-            # repeat trials and resample locations for each repitition
-            human_data = pd.concat([human_data for i in range(reps)])
-            item_locs = [
-                tuple(
-                    # 8 is maximum number of locations
-                    np.random.choice(8, size=setsize, replace=False)
-                )
-                for i in range(len(human_data))
-            ]
-            human_data['item_locs'] = item_locs
-            human_data['target_idx'] = [0] * len(human_data)
-            nontargets = np.random.choice(
-                360, size=(len(human_data), setsize - 1)
-            )
-            human_data['nontargets'] = [tuple(x) for x in nontargets]
-            human_data.astype({'target': 'int32'})
-            # Save to file for loading later
-            human_data.to_pickle(pth)
-        else:
-            # Use pickle load/save because we have tuple values in dataframe
-            human_data = pd.read_pickle(pth)
-        return human_data
-
-    def _get_key_from_idx(self, idx):
-        """
-        Get stimulus look-up key (used in various dicts) from trial index
-        corresponding to response data.
-        """
-        target = self.human_data.target.values[idx]
-        nontargets = self.human_data.nontargets.values[idx]
-        item_locs = self.human_data.item_locs.values[idx]
-        target_idx = self.human_data.target_idx.values[idx]
-        angles = list(nontargets)
-        angles.insert(target_idx, target)
-        angles = tuple(angles)
-        target_loc = item_locs[target_idx]
-        key = (angles, item_locs, target_loc, angles[target_idx])
-        return key
-
-    def _attention_dataset_iter(self, stim_id):
-        """
-        Generate dataset to do dimensionality reduction over for this stimulus.
-        Here, we assume people apply spatial attention, which implies that the
-        dataset consists of all stimuli for which there are items at the exact
-        same locations.
-        """
-        # Dataset examples are too sparse for large setsizes...
-        # df = self.human_data[self.human_data.item_locs == stim_id[1]]
-        # for idx in range(len(df)):
-        #     target = self.human_data.target.values[idx]
-        #     nontargets = self.human_data.nontargets.values[idx]
-        #     item_locs = self.human_data.item_locs.values[idx]
-        #     target_idx = self.human_data.target_idx.values[idx]
-        #     angles = list(nontargets)
-        #     angles.insert(target_idx, target)
-        #     angles = tuple(angles)
-        #     yield (angles, item_locs)
-        num_incr = self.att_dataset_max_size ** (1 / self.setsize)
-        num_incr = max(num_incr, 1)  # No higher than one sample per degree
-        angles_gen = product(
-            np.linspace(0, 360, num_incr + 1)[:-1], repeat=self.setsize
-        )
-        for angles in angles_gen:
-            yield (angles, stim_id[1])
-
-    def _stimulus_id_iter(self, sims_dict={}):
-        """
-        Identify each stimulus image with a unique id tag and iterate through
-        them. This scheme allows for caching precomputed values, as we can
-        keep a dictionary of model embeddings, whose keys are the unique
-        stimulus ids.
-        """
-        max_deg = 360
-        if self.num_incr is None:
-            self.num_incr = max_deg
-        # Dataset does not include original positions of items, so marginalize
-        # by sampling locations. Dataset can be augmented with additional
-        # samples by concatenating copies of the dataset (see __init__).
-        # Note that we assume 8 discrete locations
-        for i in tqdm(range(len(self.human_data)), dynamic_ncols=True):
-            target = self.human_data.target.values[i]
-            nontargets = self.human_data.nontargets.values[i]
-            item_locs = self.human_data.item_locs.values[i]
-            target_idx = self.human_data.target_idx.values[i]
-            angles = list(nontargets)
-            angles.insert(target_idx, target)
-            angles = tuple(angles)
-            target_loc = item_locs[target_idx]
-            Y_ids = []
-            for j in range(max_deg):
-                a = np.array(angles)
-                a[0] = j
-                Y_ids.append((tuple(a), item_locs))
-            key = (angles, item_locs, target_loc, angles[target_idx])
-            if key not in sims_dict.keys():
-                x_id = (angles, item_locs)
-                yield key, x_id, Y_ids
-
-    def analyze(self, idxs=None, dprimes=None):
-        if dprimes is None:
-            dprimes = self.dprimes
-        self._load_or_get_sims(idxs=idxs)
-        self._load_or_fit_dprimes(idxs=idxs)
-        errs = [self.sample_model_errors(dp, idxs=idxs) for dp in dprimes]
-        return self.dprime_data, errs
-
-
-# TODO: Update to new scheme using _load_augmented_data
-class TCCBae(TCCSetsize):
-    """
-    Analyze data from:
-    'Why some colors appear more memorable than others: A model combining
-    categories and particulars in color working memory.' (Bae et al.)
-    https://dro.dur.ac.uk/18552/1/18552.pdf
-    """
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError()
-        dataset = f'bae_setsize1'
-        super(TCCBae, self).__init__(
-            *args,
-            dataset=dataset,
-            lab_center=[70., 0., 0.],
-            lab_radius=38.,
-            **kwargs
-        )
-        self.human_data = load_bae()
-        self.setsize = 1
-
-    def _get_key_from_idx(self, idx):
-        """
-        Get stimulus look-up key (used in various dicts) from trial index
-        corresponding to response data.
-        """
-        key = (
-            self.human_data.hues.values[idx],
-            self.human_data.probe_loc.values[idx],
-            self.human_data.target.values[idx],
-        )
-        return key
-
-    def analyze(self, idxs=None, dprimes=None):
-        if dprimes is None:
-            dprimes = self.dprimes
-        self._load_or_get_sims(idxs=idxs)
-        self._load_or_fit_dprimes(idxs=idxs)
-        errs = [self.sample_model_errors(dp, idxs=idxs) for dp in dprimes]
-        return self.dprime_data, errs
-
 
 class TCCBays(TCCSetsize):
     """
@@ -2876,129 +2248,6 @@ class TCCBays(TCCSetsize):
         errs = [self.sample_model_errors(dp, idxs=idxs) for dp in dprimes]
         return self.dprime_data, errs
 
-    def plot_error_bias(self, dprime):
-        def _get_mean_errs(errs_dict):
-            errs_per_targ = {}  # Bin by angle
-            for key, errs_stim_i in errs_dict.items():
-                target = key[-1]
-                if target not in errs_per_targ:
-                    errs_per_targ[target] = np.array(errs_stim_i).reshape(-1)
-                else:
-                    errs_per_targ[target] = np.concatenate([
-                        errs_per_targ[target],
-                        np.array(errs_stim_i).reshape(-1)
-                    ])
-            targets = [k[-1] for k in errs_dict.keys()]
-            errs_mean = [np.mean(errs_per_targ[t]) for t in targets]
-            return targets, errs_mean
-
-        errs = self.sample_model_errors(dprime)
-        herrs_dict = self.get_human_errors_by_key()
-        fig, axs = plt.subplots(
-            nrows=len(errs) + 1, figsize=(6, 2 * (len(errs) + 1))
-        )
-        if not hasattr(axs, '__len__'):
-            axs = [axs]
-        for ax, (name, errs_dict) in zip(axs, errs.items()):
-            targets, errs_mean = _get_mean_errs(errs_dict)
-            ax.scatter(targets, errs_mean)
-            ax.set_title(f'{name}')
-            # ax.set_ylim(-25, 25)
-        htargets, herrs_mean = _get_mean_errs(herrs_dict)
-        axs[-1].scatter(htargets, herrs_mean)
-        axs[-1].set_title('human')
-        axs[-1].set_xlabel('Stimulus angle (deg)')
-        axs[-1].set_ylabel('Error (deg)')
-        plt.tight_layout()
-        fname = 'bias'
-        fname += f'_dprime{dprime}'
-        if self.attention_method == 'pca':
-            att_str = f'_pca{self.pca_explained_var}'
-        elif self.attention_method == 'nmf':
-            att_str = f'_nmf{self.nmf_comp}'
-        elif self.attention_method == 'vae':
-            att_str = f'_vae{self.att_vae_beta}'
-        else:
-            att_str = ''
-        save_pth = Path(f'figures/{self.dataset}{att_str}/{fname}.pdf')
-        save_pth.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_pth)
-
-    def plot_mean_error(self, dprime):
-        def _get_mean_errs(errs_dict):
-            errs_per_targ = {}  # Bin by angle
-            for key, errs_stim_i in errs_dict.items():
-                target = key[-1]
-                if target not in errs_per_targ:
-                    errs_per_targ[target] = np.abs(errs_stim_i).reshape(-1)
-                else:
-                    errs_per_targ[target] = np.concatenate([
-                        errs_per_targ[target], np.abs(errs_stim_i).reshape(-1)
-                    ])
-            targets = [k[-1] for k in errs_dict.keys()]
-            errs_mean = [np.mean(errs_per_targ[t]) for t in targets]
-            return targets, errs_mean
-
-        errs = self.sample_model_errors(dprime)
-        herrs_dict = self.get_human_errors_by_key()
-        fig, axs = plt.subplots(
-            nrows=len(errs) + 1, figsize=(6, 2 * (len(errs) + 1))
-        )
-        if not hasattr(axs, '__len__'):
-            axs = [axs]
-        for ax, (name, errs_dict) in zip(axs, errs.items()):
-            targets, errs_mean = _get_mean_errs(errs_dict)
-            ax.scatter(targets, errs_mean)
-            ax.set_title(f'{name}')
-            # ax.set_ylim(-25, 25)
-        htargets, herrs_mean = _get_mean_errs(herrs_dict)
-        axs[-1].scatter(htargets, herrs_mean)
-        axs[-1].set_title('human')
-        axs[-1].set_xlabel('Stimulus angle (deg)')
-        axs[-1].set_ylabel('Absolute error (deg)')
-        plt.tight_layout()
-        fname = 'abs_error'
-        fname += f'_dprime{dprime}'
-        if self.attention_method == 'pca':
-            att_str = f'_pca{self.pca_explained_var}'
-        elif self.attention_method == 'nmf':
-            att_str = f'_nmf{self.nmf_comp}'
-        elif self.attention_method == 'vae':
-            att_str = f'_vae{self.att_vae_beta}'
-        else:
-            att_str = ''
-        save_pth = Path(f'figures/{self.dataset}{att_str}/{fname}.pdf')
-        save_pth.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_pth)
-
-    def plot_error_hists(self, dprime):
-        errs = self.sample_model_errors(dprime)
-        max_deg = 180
-        fig, axs = plt.subplots(
-            nrows=len(errs), figsize=(6, 2 * len(errs))
-        )
-        if not hasattr(axs, '__len__'):
-            axs = [axs]
-        bins = np.linspace(0, max_deg / 2, max_deg // 2 + 1)
-        for ax, (name, errs_dict) in zip(axs, errs.items()):
-            errs_arr = np.concatenate([np.abs(x) for x in errs_dict.values()])
-            ax.hist(errs_arr, bins=bins[:-1])
-            ax.set_title(f'{name}')
-        plt.tight_layout()
-        fname = 'error_hist'
-        fname += f'_dprime{dprime}'
-        if self.attention_method == 'pca':
-            att_str = f'_pca{self.pca_explained_var}'
-        elif self.attention_method == 'nmf':
-            att_str = f'_nmf{self.nmf_comp}'
-        elif self.attention_method == 'vae':
-            att_str = f'_vae{self.att_vae_beta}'
-        else:
-            att_str = ''
-        save_pth = Path(f'figures/{self.dataset}{att_str}/{fname}.pdf')
-        save_pth.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_pth)
-
 
 class TCCBrady(TCCSetsize):
     """
@@ -3039,7 +2288,7 @@ class TCCBrady(TCCSetsize):
         )
         # Items always at same locations. Here, indexes (0, 1, 2) correspond to
         # angles (0, 120, 240) deg along invisible anulus
-        item_locs = (0. + 90., 120. + 90., 240. + 90.)  # Add 90 deg for correct orientation
+        item_locs = (0. + 90., 120. + 90., 240. + 90.)  # Add 90 deg shift for correct visualization
         probe_loc = self.human_data.probe_loc.values[idx]
         key = (angles, item_locs, probe_loc, angles[probe_loc])
         return key
@@ -3075,129 +2324,6 @@ class TCCBrady(TCCSetsize):
         errs = [self.sample_model_errors(dp, idxs=idxs) for dp in dprimes]
         return self.dprime_data, errs
 
-    def plot_error_bias(self, dprime):
-        def _get_mean_errs(errs_dict):
-            errs_per_targ = {}  # Bin by angle
-            for key, errs_stim_i in errs_dict.items():
-                target = key[-1]
-                if target not in errs_per_targ:
-                    errs_per_targ[target] = np.array(errs_stim_i).reshape(-1)
-                else:
-                    errs_per_targ[target] = np.concatenate([
-                        errs_per_targ[target],
-                        np.array(errs_stim_i).reshape(-1)
-                    ])
-            targets = [k[-1] for k in errs_dict.keys()]
-            errs_mean = [np.mean(errs_per_targ[t]) for t in targets]
-            return targets, errs_mean
-
-        errs = self.sample_model_errors(dprime)
-        herrs_dict = self.get_human_errors_by_key()
-        fig, axs = plt.subplots(
-            nrows=len(errs) + 1, figsize=(6, 2 * (len(errs) + 1))
-        )
-        if not hasattr(axs, '__len__'):
-            axs = [axs]
-        for ax, (name, errs_dict) in zip(axs, errs.items()):
-            targets, errs_mean = _get_mean_errs(errs_dict)
-            ax.scatter(targets, errs_mean)
-            ax.set_title(f'{name}')
-            # ax.set_ylim(-25, 25)
-        htargets, herrs_mean = _get_mean_errs(herrs_dict)
-        axs[-1].scatter(htargets, herrs_mean)
-        axs[-1].set_title('human')
-        axs[-1].set_xlabel('Stimulus angle (deg)')
-        axs[-1].set_ylabel('Error (deg)')
-        plt.tight_layout()
-        fname = 'bias'
-        fname += f'_dprime{dprime}'
-        if self.attention_method == 'pca':
-            att_str = f'_pca{self.pca_explained_var}'
-        elif self.attention_method == 'nmf':
-            att_str = f'_nmf{self.nmf_comp}'
-        elif self.attention_method == 'vae':
-            att_str = f'_vae{self.att_vae_beta}'
-        else:
-            att_str = ''
-        save_pth = Path(f'figures/{self.dataset}{att_str}/{fname}.pdf')
-        save_pth.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_pth)
-
-    def plot_mean_error(self, dprime):
-        def _get_mean_errs(errs_dict):
-            errs_per_targ = {}  # Bin by angle
-            for key, errs_stim_i in errs_dict.items():
-                target = key[-1]
-                if target not in errs_per_targ:
-                    errs_per_targ[target] = np.abs(errs_stim_i).reshape(-1)
-                else:
-                    errs_per_targ[target] = np.concatenate([
-                        errs_per_targ[target], np.abs(errs_stim_i).reshape(-1)
-                    ])
-            targets = [k[-1] for k in errs_dict.keys()]
-            errs_mean = [np.mean(errs_per_targ[t]) for t in targets]
-            return targets, errs_mean
-
-        errs = self.sample_model_errors(dprime)
-        herrs_dict = self.get_human_errors_by_key()
-        fig, axs = plt.subplots(
-            nrows=len(errs) + 1, figsize=(6, 2 * (len(errs) + 1))
-        )
-        if not hasattr(axs, '__len__'):
-            axs = [axs]
-        for ax, (name, errs_dict) in zip(axs, errs.items()):
-            targets, errs_mean = _get_mean_errs(errs_dict)
-            ax.scatter(targets, errs_mean)
-            ax.set_title(f'{name}')
-            # ax.set_ylim(-25, 25)
-        htargets, herrs_mean = _get_mean_errs(herrs_dict)
-        axs[-1].scatter(htargets, herrs_mean)
-        axs[-1].set_title('human')
-        axs[-1].set_xlabel('Stimulus angle (deg)')
-        axs[-1].set_ylabel('Absolute error (deg)')
-        plt.tight_layout()
-        fname = 'abs_error'
-        fname += f'_dprime{dprime}'
-        if self.attention_method == 'pca':
-            att_str = f'_pca{self.pca_explained_var}'
-        elif self.attention_method == 'nmf':
-            att_str = f'_nmf{self.nmf_comp}'
-        elif self.attention_method == 'vae':
-            att_str = f'_vae{self.att_vae_beta}'
-        else:
-            att_str = ''
-        save_pth = Path(f'figures/{self.dataset}{att_str}/{fname}.pdf')
-        save_pth.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_pth)
-
-    def plot_error_hists(self, dprime):
-        errs = self.sample_model_errors(dprime)
-        max_deg = 180
-        fig, axs = plt.subplots(
-            nrows=len(errs), figsize=(6, 2 * len(errs))
-        )
-        if not hasattr(axs, '__len__'):
-            axs = [axs]
-        bins = np.linspace(0, max_deg / 2, max_deg // 2 + 1)
-        for ax, (name, errs_dict) in zip(axs, errs.items()):
-            errs_arr = np.concatenate([np.abs(x) for x in errs_dict.values()])
-            ax.hist(errs_arr, bins=bins[:-1])
-            ax.set_title(f'{name}')
-        plt.tight_layout()
-        fname = 'error_hist'
-        fname += f'_dprime{dprime}'
-        if self.attention_method == 'pca':
-            att_str = f'_pca{self.pca_explained_var}'
-        elif self.attention_method == 'nmf':
-            att_str = f'_nmf{self.nmf_comp}'
-        elif self.attention_method == 'vae':
-            att_str = f'_vae{self.att_vae_beta}'
-        else:
-            att_str = ''
-        save_pth = Path(f'figures/{self.dataset}{att_str}/{fname}.pdf')
-        save_pth.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_pth)
-
 
 def _get_binned_averages(values_dict, bins, use_abs=True, transform=lambda x: x):
     """
@@ -3224,7 +2350,8 @@ def _get_binned_averages(values_dict, bins, use_abs=True, transform=lambda x: x)
             values_binned[bin_idx] = list(val)
     # Average within each bin
     values_binned1 = {
-        key: transform(np.abs(list(val))).mean() if use_abs else np.mean(list(val))
+        key: transform(np.abs(list(val))).mean()
+        if use_abs else transform(np.mean(list(val)))
         for key, val in values_binned.items()
     }
     return values_binned1
@@ -3251,6 +2378,7 @@ def human_setsize_analysis(
     TCCClass,
     setsizes,
     *args,
+    use_abs=True,
     num_boot=1000,
     **kwargs,
 ):
@@ -3264,6 +2392,8 @@ def human_setsize_analysis(
     function of the whole display).
     """
 
+    err_str = '' if use_abs else '_signed_error'
+
     if TCCClass is TCCBays:
         # Symmetric, oriented objects repeat every 180 deg
         max_deg = 180
@@ -3271,8 +2401,11 @@ def human_setsize_analysis(
         max_deg = 360
     if TCCClass is TCCBrady:
         # For this dataset, we have response data for all items in each
-        # display, so we shouldn't marginalize over these values
-        bin_ave_func = _get_binned_averages_brady
+        # display, so we have option to not marginalize over these values
+        # (Note: If I return to this, it needs to be fixed so the ordering is
+        # always the same for the 144 unique stimulus keys.)
+        # bin_ave_func = _get_binned_averages_brady
+        bin_ave_func = _get_binned_averages
     else:
         # For other datasets, we do not have complete data, so we should
         # marginalized over unprobed items
@@ -3286,6 +2419,7 @@ def human_setsize_analysis(
     bins = np.arange(0, max_deg + 1, binsize)
 
     data = pd.DataFrame({
+        'model_class': [],
         'model_name': [],
         'setsize': [],
         'dprime': [],
@@ -3313,16 +2447,12 @@ def human_setsize_analysis(
         df = tcc.human_data
         human_mean_abs_error = np.abs(df[df.K == K].error.values).mean()
         human_errs_by_stim = tcc.get_human_errors_by_key()
-        human_errs_binned = bin_ave_func(human_errs_by_stim, bins)
+        human_errs_binned = bin_ave_func(
+            human_errs_by_stim, bins, use_abs=use_abs
+        )
         for mclass in cmd_args.model_classes:
-            # load_pth = Path(
-            #     f'{MODEL_OUT_PATH}/setsize_analysis/{dataset}/summary_{mclass}_ss{K}.csv'
-            # )
-            # if load_pth.exists():
-            #     data_m = pd.read_csv(load_pth)
-            #     print(f'Loaded summary data from {load_pth}')
-            # else:
             data_m = pd.DataFrame({
+                'model_class': [],
                 'model_name': [],
                 'setsize': [],
                 'dprime': [],
@@ -3333,40 +2463,19 @@ def human_setsize_analysis(
                 'conf_int95_lower': [],
                 'conf_int95_upper': [],
             })
-            for dprime in dprimes[mclass]:
-                tcc0 = TCCClass(  # Make this object just to get idxs
-                    K,
-                    *args,
-                    ngrid=cmd_args.num_grid,
-                    N=cmd_args.num_hist_samples,
-                    noise_type=cmd_args.noise_type,
-                    model_classes=[mclass],
-                    model_layers=cmd_args.model_layers,
-                    dprimes=dprimes,
-                    **kwargs
-                )
-                for idx in tcc0.idxs:
-                    mname = tcc0.models.name.values[idx]
+            for dprime in tcc.dprimes[mclass]:
+                idxs = tcc.models[tcc.models.model_class == mclass].index
+                for idx in idxs:
+                    mname = tcc.models.name.values[idx]
                     load_pth = Path(
                         f'{MODEL_OUT_PATH}/setsize_analysis/{dataset}/summary_'
-                        f'{mclass}_ss{K}_dp{dprime}_{mname}.csv'
+                        f'{mclass}_ss{K}_dp{dprime}_{mname}{err_str}.csv'
                     )
                     if load_pth.exists():
                         # Load summary from file to save time
-                        row_data = pd.read_csv(load_pth)
+                        row_data = pd.read_csv(load_pth, index_col=0)
                         print(f'Loaded summary data from {load_pth}')
                     else:
-                        tcc = TCCClass(
-                            K,
-                            *args,
-                            ngrid=cmd_args.num_grid,
-                            N=cmd_args.num_hist_samples,
-                            noise_type=cmd_args.noise_type,
-                            model_classes=[mclass],
-                            model_layers=cmd_args.model_layers,
-                            dprimes=dprimes,
-                            **kwargs
-                        )
                         dprime_data, model_errs = tcc.analyze(
                             dprimes=[dprime], idxs=[idx]
                         )
@@ -3376,7 +2485,7 @@ def human_setsize_analysis(
                             for i in range(len(df_sub))
                         }
                         model_errs_binned = bin_ave_func(
-                            model_errs[0][mname], bins
+                            model_errs[0][mname], bins, use_abs=use_abs
                         )
                         # Binned rank correlations (binning lowers noise by averaging)
                         rho, pval = spearmanr(
@@ -3384,6 +2493,7 @@ def human_setsize_analysis(
                             list(model_errs_binned.values())
                         )
                         row_data = {
+                            'model_class': [mclass],
                             'model_name': [mname],
                             'setsize': [K],
                             'dprime': [dprime],
@@ -3405,24 +2515,8 @@ def human_setsize_analysis(
                 TCC_SAMPLE = {}  # Clear to save memory
             data = pd.concat([data, data_m])
 
-        # Append human data
-        data = pd.concat([
-            data,
-            pd.DataFrame({
-                'model_name': ['human'],
-                'setsize': [K],
-                'dprime': [np.nan],
-                'loglik': [np.nan],
-                'mean_abs_err': [human_mean_abs_error],
-                f'spearman_r_binsize{binsize}': [np.nan],
-                f'spearman_pval_binsize{binsize}': [np.nan],
-                'conf_int95_lower': [np.nan],
-                'conf_int95_upper': [np.nan],
-            })
-        ], ignore_index=True)
-
         conf_int_pth = Path(
-            f'{MODEL_OUT_PATH}/confidence_intervals/{dataset}/setsize_{K}.npy'
+            f'{MODEL_OUT_PATH}/confidence_intervals/{dataset}/setsize_{K}{err_str}.npy'
         )
         if conf_int_pth.exists():
             conf_lower, conf_upper = np.load(conf_int_pth)
@@ -3439,7 +2533,9 @@ def human_setsize_analysis(
                     replace=True
                 )
                 herrs_by_stim_i = tcc.get_human_errors_by_key(boot_idxs)
-                herrs_binned_i = bin_ave_func(herrs_by_stim_i, bins)
+                herrs_binned_i = bin_ave_func(
+                    herrs_by_stim_i, bins, use_abs=use_abs
+                )
                 spearman_boot.append(
                     spearmanr(
                         list(human_errs_binned.values()),
@@ -3451,20 +2547,35 @@ def human_setsize_analysis(
             conf_upper = rhos[int(round(num_boot * 0.95))]
             conf_int_pth.parent.mkdir(parents=True, exist_ok=True)
             np.save(conf_int_pth, np.array([conf_lower, conf_upper]))
-        idxs = (data.model_name == 'human') * (data.setsize == K)
-        data.loc[idxs, 'conf_int95_lower'] = conf_lower
-        data.loc[idxs, 'conf_int95_upper'] = conf_upper
+
+        # Append human data
+        human_df = pd.DataFrame({
+            'model_class': ['human'],
+            'model_name': ['human'],
+            'setsize': [K],
+            'dprime': [np.nan],
+            'loglik': [np.nan],
+            'mean_abs_err': [human_mean_abs_error],
+            f'spearman_r_binsize{binsize}': [np.nan],
+            f'spearman_pval_binsize{binsize}': [np.nan],
+            'conf_int95_lower': [conf_lower],
+            'conf_int95_upper': [conf_upper],
+        })
+        human_df_pth = Path(
+            f'{MODEL_OUT_PATH}/setsize_analysis/{dataset}/summary_human'
+            f'_ss{K}{err_str}.csv'
+        )
+        human_df.to_csv(human_df_pth)
+        data = pd.concat([data, human_df], ignore_index=True)
     return data
 
 
 def brady_analysis(
     args,
     dprimes,
-    attention_method=None,
-    pca_explained_var=1,
-    nmf_comp=10,
-    att_vae_beta=1.,
+    use_abs=True,
     max_mem=64,
+    num_cpus=None,
 ):
     """
     Tim Brady study:
@@ -3475,29 +2586,10 @@ def brady_analysis(
         dprimes,
         TCCBrady,
         [3],
-        # To explain setsize effects, keep similarity scaling fixed (here we
-        # just choose set-size 1, but could be any set-size)
-        # inherit_from=f'{dataset}_setsize1',
-        attention_method=attention_method,
-        pca_explained_var=pca_explained_var,
-        nmf_comp=nmf_comp,
-        att_vae_beta=args.att_vae_beta,
+        use_abs=use_abs,
         max_mem=max_mem,
+        num_cpus=num_cpus,
     )
-    if attention_method == 'pca':
-        att_str = f'_pca{pca_explained_var}'
-    elif attention_method == 'nmf':
-        att_str = f'_nmf{nmf_comp}'
-    elif attention_method == 'vae':
-        att_str = f'_vae{att_vae_beta}'
-    else:
-        att_str = ''
-    save_pth = Path(
-        f'{MODEL_OUT_PATH}/setsize_analysis/brady_alvarez/summary{att_str}.csv'
-    )
-    save_pth.parent.mkdir(parents=True, exist_ok=True)
-    model_data.to_csv(save_pth)
-    from ipdb import set_trace; set_trace()
 
 
 def taylor_bays_analysis(
@@ -3505,12 +2597,10 @@ def taylor_bays_analysis(
     dprimes,
     dataset='bays2014',
     setsizes=[1, 2, 4, 8],
-    attention_method=None,
-    pca_explained_var=1,
-    nmf_comp=10,
-    att_vae_beta=1.,
     reps=1,
     max_mem=64,
+    use_abs=True,
+    num_cpus=None,
 ):
     model_data = human_setsize_analysis(
         args,
@@ -3522,173 +2612,10 @@ def taylor_bays_analysis(
         # just choose set-size 1, but could be any set-size)
         inherit_from=f'{dataset}_setsize1',
         reps=reps,
-        attention_method=attention_method,
-        pca_explained_var=pca_explained_var,
-        nmf_comp=nmf_comp,
-        att_vae_beta=args.att_vae_beta,
         max_mem=max_mem,
+        use_abs=use_abs,
+        num_cpus=num_cpus,
     )
-    if attention_method == 'pca':
-        att_str = f'_pca{pca_explained_var}'
-    elif attention_method == 'nmf':
-        att_str = f'_nmf{nmf_comp}'
-    elif attention_method == 'vae':
-        att_str = f'_vae{att_vae_beta}'
-    else:
-        att_str = ''
-    save_pth = Path(
-        f'{MODEL_OUT_PATH}/setsize_analysis/{dataset}/summary{att_str}.csv'
-    )
-    save_pth.parent.mkdir(parents=True, exist_ok=True)
-    model_data.to_csv(save_pth)
-    from ipdb import set_trace; set_trace()
-
-
-def bae_analysis(args, dprimes, reps=1, max_mem=64):
-    # TODO: Update
-    model_data = human_setsize_analysis(
-        args,
-        dprimes,
-        TCCBae,
-        [1],
-        'figures/bae',
-        reps=reps,
-        max_mem=max_mem,
-    )
-
-
-def panichello_analysis(
-    args,
-    dprimes,
-    RIs=[1],
-    setsizes=[1, 3],
-    reps=1,
-    attention_method=None,
-    pca_explained_var=1,
-    nmf_comp=10,
-    att_vae_beta=1.,
-    max_mem=64
-):
-    model_data = human_setsize_analysis(
-        args,
-        dprimes,
-        TCCPanichello,
-        setsizes,
-        RIs,
-        reps=reps,
-        attention_method=attention_method,
-        pca_explained_var=pca_explained_var,
-        nmf_comp=nmf_comp,
-        att_vae_beta=args.att_vae_beta,
-        max_mem=max_mem,
-    )
-
-
-def dnn_arch_comparison():
-    summary_pths = Path(
-        f'{MODEL_OUT_PATH}/scene_wheels_analysis/'
-    ).glob('summary_data_*.csv')
-    data = pd.concat([pd.read_csv(pth) for pth in summary_pths])
-    data = data[data.radius == 'all']
-    all_models = [
-        'vgg19',
-        'resnet50',
-        # 'places_resnet50',  # TODO: Redo analysis with more layers
-        'harmonized_RN50',
-        'convnext_base',
-        'convnext_base_1k',
-        'convnext_large',
-        'convnext_large_1k',
-        'clip_RN50',
-        'clip_RN50x4',
-        'clip_RN50x16',
-        'clip_RN101',
-        'clip_ViT-B16',
-    ]
-    resnet50_models = [
-        'resnet50',
-        # 'places_resnet50',  # TODO: Redo analysis with more layers
-        'clip_RN50',
-        'harmonized_RN50',
-    ]
-    convnext_models = [
-        name for name in all_models if 'convnext' in name
-    ]
-    clip_models = [
-        name for name in all_models if 'clip' in name
-    ]
-    df = pd.DataFrame({
-        'name': [],
-        'model_class': [],
-        'label': [],
-        'num_params': [],
-        'num_training_images': [],
-        'max_spearman': [],
-    })
-    for name in all_models:
-        if 'convnext' in name:
-            model_class = 'convnext'
-            label = 'ConvNext'
-            if '1k' in name:
-                num_training_images = 1.28e6
-            else:
-                num_training_images = 1.42e7
-        elif 'clip' in name:
-            model_class = 'clip'
-            label = 'CLIP'
-            num_training_images = 4e8
-        else:
-            label = name
-            if 'places' in name:
-                model_class = 'places'
-                num_training_images = 1e7
-            if 'vae' in name:
-                model_class = 'vae'
-                num_training_images = 1e7
-            else:
-                model_class = 'torchvision'
-                num_training_images = 1.28e6
-        df = pd.concat([
-            df,
-            pd.DataFrame({
-                'name': [name],
-                'model_class': [model_class],
-                'label': [label],
-                'num_params': [count_model_params(name)],
-                'num_training_images': [num_training_images],
-                'max_spearman': [
-                    data[
-                        data.model_name.str.startswith(name)
-                    ].spearman_r.max()
-                ],
-            })
-        ])
-
-    max_params = df.num_params.max()
-
-    fig, ax = plt.subplots()
-    for lab, dfg in df.groupby('label'):
-        ax.scatter(
-            dfg.num_training_images,
-            dfg.max_spearman,
-            label=lab,
-            s=dfg.num_params / max_params * 1200,
-            alpha=0.5,
-        )
-
-    handles = [
-        ax.annotate(name, (x, y), fontsize=12)
-        for name, x, y in zip(df.name, df.num_training_images, df.max_spearman)
-    ]
-    from adjustText import adjust_text
-    adjust_text(handles, avoid_points=False, avoid_text=True, only_move={'text': 'y'})
-    ax.set_xscale('log')
-    ax.set_xlabel('# training images')
-    ax.set_ylabel('Max Spearman rho (all trials)')
-    plt.tight_layout()
-    plt.savefig('figures/summary/scene_wheels/dnn_comparison_all.pdf')
-
-    from ipdb import set_trace; set_trace()
 
 
 def make_vae_args(beta=0.1, start_epoch=9, layer=None, pixel_only=True):
@@ -3778,16 +2705,6 @@ if __name__ == '__main__':
         '--arch-comparison',
         action='store_true',
         help='Do DNN architectures comparison analysis on scene wheels data.'
-    )
-    parser.add_argument(
-        '--panichello',
-        action='store_true',
-        help='Do analysis with Panichello et al. human data.'
-    )
-    parser.add_argument(
-        '--bae',
-        action='store_true',
-        help='Do analysis with Bae et al. human data.'
     )
     parser.add_argument(
         '--taylor-bays',
@@ -3889,7 +2806,12 @@ if __name__ == '__main__':
         dnn_arch_comparison()
 
     if args.scene_wheels_summary:
-        tcc_macklab = TCCSceneWheel(
+        dprimes = {
+            # Need different grid range for color-channels baseline model
+            'rgb': np.linspace(300, 600, 4),
+        }
+        tcc = TCCSceneWheel(
+            dprimes=dprimes,
             ngrid=args.num_grid,
             dp_min=args.dprime_range[0],
             dp_max=args.dprime_range[1],
@@ -3897,61 +2819,22 @@ if __name__ == '__main__':
             noise_type=args.noise_type,
             model_classes=args.model_classes,
             inherit_from=args.inherit_from,
-            attention_method=args.attention_method,
-            pca_explained_var=args.pca_explained_var,
-            nmf_comp=args.nmf_comp,
-            att_vae_beta=args.att_vae_beta,
             max_mem=args.max_mem,
-            # vgg_layers=args.vgg_layers,
             model_layers=args.model_layers,
             num_cpus=args.num_cpus,
         )
-        df = tcc_macklab.summary()
-        for rad in [2, 4, 8, 16, 32]:
-            print(f'RADIUS={rad}')
-            tcc_macklab.perceptual_similarity_analysis(
-                df, args.model_classes, radius=rad
-            )
-
-    num_incr_defaults = {
-        # Dataset sizes are exponential in number of items, so use sparser
-        # sampling with larger set-sizes
-        'colors': {1: 360, 2: 48, 3: 16},
-        'gabors': {1: 180, 2: 24, 3: 8},
-    }
-
+        df = tcc.summary()
+        # WASN'T USEFUL
+        # for rad in [2, 4, 8, 16, 32]:
+        #     print(f'RADIUS={rad}')
+        #     tcc.perceptual_similarity_analysis(
+        #         df, args.model_classes, radius=rad
+        #     )
     if args.brady_alvarez:
         dprimes_ss = [
             1., 1.5, 2., 2.5, 3., 3.5, 4.5, 5., 6., 7., 8., 9., 10., 12.5, 15., 17.5, 20.
         ]
-        brady_analysis(args, dprimes_ss)
-    if args.panichello:
-        dprimes_ss = [
-            1., 1.5, 2., 2.5, 3., 3.5, 4.5, 5., 6., 7., 8., 9., 10., 12.5, 15., 17.5, 20.
-        ]
-        panichello_analysis(
-            args,
-            dprimes_ss,
-            setsizes=args.setsizes,
-            attention_method=args.attention_method,
-            pca_explained_var=args.pca_explained_var,
-            nmf_comp=args.nmf_comp,
-            att_vae_beta=args.att_vae_beta,
-            max_mem=args.max_mem,
-        )
-    if args.bae:
-        dprimes_ss = [
-            1., 1.5, 2., 2.5, 3., 3.5, 4.5, 5., 6., 7., 8., 9., 10., 12.5, 15., 17.5, 20.
-        ]
-        bae_analysis(
-            args,
-            dprimes_ss,
-            attention_method=args.attention_method,
-            pca_explained_var=args.pca_explained_var,
-            nmf_comp=args.nmf_comp,
-            att_vae_beta=args.att_vae_beta,
-            max_mem=args.max_mem,
-        )
+        brady_analysis(args, dprimes_ss, num_cpus=args.num_cpus)
     if args.taylor_bays:
         dprimes_ss = {
             'vgg19': [
@@ -3978,9 +2861,6 @@ if __name__ == '__main__':
             dataset='bays2014',  # Colored lines
             # dataset='bays2014_gabors',  # Test generality of results using gabors instead of lines
             setsizes=args.setsizes,
-            attention_method=args.attention_method,
-            pca_explained_var=args.pca_explained_var,
-            nmf_comp=args.nmf_comp,
-            att_vae_beta=args.att_vae_beta,
             max_mem=args.max_mem,
+            num_cpus=args.num_cpus,
         )
