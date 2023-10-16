@@ -35,8 +35,12 @@ For one analysis, I used CounTR (https://github.com/Verg-Avesta/CounTR). I copie
  
 Not all of these packages may be necessary for all analyses, so if you are experiencing compatibility issues, I recommend commenting out code you don't need. Installation time for Python packages on typical laptop hardware should a few minutes.
 
+DATA  
+
+Human data for the scene wheels experiments can be found at scene_wheels_mack_lab_osf/Data/sceneWheel_main_data_n20.csv. For the color working memory experiments, it can be found at brady_alvarez/dataTestAllDegreesOrd.mat. For the orientation WM experiments it can be found at taylor_bays/Exp1_bays2014.mat.
+
  
-USAGE: 
+USAGE 
  
 To fit TCC models for different DNN architectures on human responses in Scene Wheels dataset and save results to file: 
  
