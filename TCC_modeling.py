@@ -2702,11 +2702,6 @@ if __name__ == '__main__':
         help='Do scene-wheel model comparison and get summary.'
     )
     parser.add_argument(
-        '--arch-comparison',
-        action='store_true',
-        help='Do DNN architectures comparison analysis on scene wheels data.'
-    )
-    parser.add_argument(
         '--taylor-bays',
         action='store_true',
         help='Do analysis with Taylor & Bays human data.'
@@ -2801,9 +2796,6 @@ if __name__ == '__main__':
         help='Number of CPUs to use in parallelized p_map function.'
     )
     args = parser.parse_args()
-
-    if args.arch_comparison:
-        dnn_arch_comparison()
 
     if args.scene_wheels_summary:
         dprimes = {

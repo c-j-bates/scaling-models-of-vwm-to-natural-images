@@ -38,7 +38,6 @@ Not all of these packages may be necessary for all analyses, so if you are exper
 DATA  
 
 Human data for the scene wheels experiments can be found at scene_wheels_mack_lab_osf/Data/sceneWheel_main_data_n20.csv. For the color working memory experiments, it can be found at brady_alvarez/dataTestAllDegreesOrd.mat. For the orientation WM experiments it can be found at taylor_bays/Exp1_bays2014.mat.
-
  
 USAGE 
  
@@ -50,18 +49,18 @@ Code can be tested on the 'rgb' baseline model, which is less resource-intensive
 
 `python TCC_modeling.py --model-classes rgb --scene-wheels-summary`  
  
-To produce the DNN comparison scatter plot:  
- 
-`python TCC_modeling.py --arch-comparison`  
-
-(The set of models to be compared is hard-coded in the dnn_arch_comparison function. These need to be run beforehand using the commands above using the --scene-wheels-summary flag.)
- 
 To fit models on VWM datasets, do: 
   
 `python TCC_modeling.py --model-classes vgg19 clip_RN50 clip_ViT-B16 --taylor-bays`  
 `python TCC_modeling.py --model-classes vgg19 clip_RN50 clip_ViT-B16 --brady-alvarez`  
  
 (Note that these analyses are very resource-intensive and can take a long time to run. I used a high-performance computing cluster with GPUs, many CPU cores, and large storage. I also ran models in parallel for more efficient resource use. My scripts save various intermediate results to file to enable restarts. I have not included these intermediate files in this repo due to their large sizes. Also note that the variable `attention_method` and related variables refer to functionality I ended up abandoning. Same for attention-related variables related to training the VAE.) 
+ 
+To train the VAE baseline model, do:
+
+ `python train.py`  
+
+ (Note: Be sure to change the file paths to be consistent with your setup.) 
  
 To run analyses:  
  
